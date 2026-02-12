@@ -2,7 +2,7 @@
 // QR codes point to standalone resolver at batch-id-pro-mi3x.vercel.app/b/:id
 // No hash routing, no BrowserRouter, no conflicts.
 
-import { useState, useMemo, useCallback, useEffect  } from "react";
+import { useState, useMemo, useCallback, useEffect } from "react";
 import { QRCodeSVG } from "qrcode.react";
 
 // ─── RESOLVER URL ────────────────────────────────────────────────────────────
@@ -241,9 +241,9 @@ export default function App() {
       <div style={S.container}>
         {view==="dashboard" && <Dashboard stats={stats} setView={setView} />}
         {view==="batches" && <BatchesView batches={filteredBatches} tab={batchTab} setTab={setBatchTab} openBatch={openBatch} deleteBatch={deleteBatch} />}
-        {view==="inbound" && <CreateDocketView batchType="inbound" createBatch={createBatch} companyLibrary={companyLibrary} addToast={addToast} setView={setView} />}
-        {view==="outbound" && <CreateDocketView batchType="outbound" createBatch={createBatch} companyLibrary={companyLibrary} addToast={addToast} setView={setView} />}
-        {view==="batch" && selectedBatch && <BatchDetail batch={selectedBatch} updateBatch={updateBatch} deleteBatch={deleteBatch} archiveBatch={archiveBatch} unarchiveBatch={unarchiveBatch} closeBatch={closeBatch} addToast={addToast} companyLibrary={companyLibrary} />}
+        {view==="inbound" && <CreateDocketView batchType="inbound" createBatch={createBatch} speciesLibrary={speciesLibrary} companyLibrary={companyLibrary} addToast={addToast} setView={setView} />}
+        {view==="outbound" && <CreateDocketView batchType="outbound" createBatch={createBatch} speciesLibrary={speciesLibrary} companyLibrary={companyLibrary} addToast={addToast} setView={setView} />}
+        {view==="batch" && selectedBatch && <BatchDetail batch={selectedBatch} updateBatch={updateBatch} deleteBatch={deleteBatch} archiveBatch={archiveBatch} unarchiveBatch={unarchiveBatch} closeBatch={closeBatch} addToast={addToast} speciesLibrary={speciesLibrary} companyLibrary={companyLibrary} />}
         {view==="batch" && !selectedBatch && <div style={{padding:32}}><h2>Batch not found</h2><button style={{...S.btn,...S.btnSecondary,marginTop:16}} onClick={()=>setView("dashboard")}>Back to Dashboard</button></div>}
         {view==="eow" && <EOWView batches={completedBatches} openBatch={openBatch} />}
         {view==="archive" && <ArchiveView batches={archivedBatches} openBatch={openBatch} unarchiveBatch={unarchiveBatch} />}
@@ -491,7 +491,7 @@ function CreateDocketView({batchType,createBatch,speciesLibrary,companyLibrary,a
 }
 
 // ─── BATCH DETAIL ─────────────────────────────────────────────────────────────
-function BatchDetail({batch,updateBatch,deleteBatch,archiveBatch,unarchiveBatch,closeBatch,addToast,companyLibrary}:any) {
+function BatchDetail({batch,updateBatch,deleteBatch,archiveBatch,unarchiveBatch,closeBatch,addToast,speciesLibrary,companyLibrary}:any) {
   const [landingCertNo,setLandingCertNo] = useState(batch.landingCertNo||"");
   const [processingCertNo,setProcessingCertNo] = useState(batch.processingCertNo||"");
   const [catchCertNo,setCatchCertNo] = useState(batch.catchCertNo||"");
