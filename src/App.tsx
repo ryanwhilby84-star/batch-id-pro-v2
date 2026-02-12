@@ -76,7 +76,7 @@ function encodeBatch(batch: Batch): string {
 // ─── LOGO / BRANDING ─────────────────────────────────────────────────────────
 const LOGO_URL = "https://res.cloudinary.com/dmnuqcykq/image/upload/v1770027904/ChatGPT_Image_Feb_2_2026_10_24_54_AM_f99qva.png";
 const APP_NAME = "Batch ID Pro";
-const BRAND = "Powered by Core Systems NI";
+
 
 // ─── MAIN APP ─────────────────────────────────────────────────────────────────
 
