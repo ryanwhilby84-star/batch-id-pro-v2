@@ -4,10 +4,21 @@
 
 import { useState, useMemo, useCallback, useEffect } from "react";
 import { QRCodeSVG } from "qrcode.react";
+import { createClient, type Session } from "@supabase/supabase-js";
 
-// ─── RESOLVER URL ────────────────────────────────────────────────────────────
-// Change this to your resolver domain once you have a custom domain
-const RESOLVER_BASE = typeof window !== "undefined" ? window.location.origin : "https://batch-id-pro.vercel.app";
+// ─── PUBLIC BASE URL + SUPABASE ───────────────────────────────────────────────
+// In production, set VITE_PUBLIC_BASE_URL in Vercel env vars to your live domain
+// e.g. https://batch-id-pro-v2.vercel.app (or your custom domain)
+// FINAL: QR base is ALWAYS the public domain. No localhost fallbacks.
+const PUBLIC_BASE_URL = "https://batch-id-pro-v2-app.vercel.app";
+
+const SUPABASE_URL = "https://ftpmvjsmvstvuahrbcpq.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ0cG12anNtdnN0dnVhaHJiY3BxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA5NzcwMzgsImV4cCI6MjA4NjU1MzAzOH0.39s4Xeh0SbXaH8LtHbIPhsotG90Mr83o0E0mq9Gr9hs";
+
+const supabase =
+  SUPABASE_URL && SUPABASE_ANON_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+    : null;
 
 // ─── TYPES ───────────────────────────────────────────────────────────────────
 type BatchType = "inbound" | "outbound";
@@ -15,7 +26,9 @@ type BatchStatus = "Created" | "In Transit" | "Completed" | "Archived";
 type View = "dashboard" | "batches" | "batch" | "inbound" | "outbound" | "eow" | "archive" | "species" | "companies" | "settings";
 type Toast = { id: string; type: "success" | "error" | "info"; message: string };
 type SpeciesLine = { species: string; weightKg: number };
-type TransportLeg = { transportCompany: string; vehicleReg: string; handoverTime: string; notes?: string };
+type TransportLeg = { transportCompany: string; vehicleReg: string; handoverTime: string; notes?: string; regPhotoUrl?: string };
+
+type VehicleReg = { id: string; registration: string; entry?: string; photoUrl?: string };
 
 interface Batch {
   id: string;
@@ -45,6 +58,7 @@ const STORAGE_KEY = "batchidpro_v1";
 const OUR_COMPANY_KEY = "batchidpro_ourcompany";
 const SPECIES_KEY = "batchidpro_species";
 const COMPANY_KEY = "batchidpro_companies";
+const VEHICLES_KEY = "batchidpro_vehicles";
 
 const DEFAULT_SPECIES = ["Cod","Haddock","Hake","Whiting","Monkfish","Scallops","Mackerel","Herring","Plaice","Sole","Nephrops (Prawns)","Pollock","Skate"];
 const DEFAULT_COMPANIES = ["Portavogie Fish Co.","Ards Marine","Lough Catch Ltd","North Coast Supplies","Kilkeel Seafoods","Belfast Cold Store","McIlroy Logistics","NI Reefer Haulage","SeaChain Transport","ColdRun Ltd"];
@@ -55,6 +69,21 @@ function lsJson<T>(key: string, fallback: T): T { try { const v = ls(key); retur
 
 function loadBatches(): Batch[] { return lsJson<Batch[]>(STORAGE_KEY, []); }
 function saveBatches(b: Batch[]) { lsSet(STORAGE_KEY, JSON.stringify(b)); }
+
+// Sync a single batch to Supabase so QR short-links work
+// Table: batches (id text PK, user_id uuid, batch_data jsonb, updated_at timestamptz)
+// RLS: INSERT/UPDATE require auth; SELECT is public (for receipt scanning)
+async function syncBatchToSupabase(batch: Batch, userId: string) {
+  if (!supabase) return;
+  try {
+    await supabase.from("batches").upsert({
+      id: batch.id,
+      user_id: userId,
+      batch_data: batch,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: "id" });
+  } catch(e) { console.warn("Supabase sync failed", e); }
+}
 
 // ─── UTILS ───────────────────────────────────────────────────────────────────
 const uid = () => Math.random().toString(16).slice(2,10).toUpperCase();
@@ -177,23 +206,69 @@ function PublicReceipt({ batch }: { batch: any }) {
   );
 }
 
-export default function App() {
-  // ── Receipt route detection ──
-  // If URL has ?receipt=ID&d=DATA, show public receipt page instead of app
-  if (typeof window !== "undefined") {
-    const params = new URLSearchParams(window.location.search);
-    const receiptId = params.get("receipt");
-    const encoded = params.get("d");
-    if (receiptId && encoded) {
-      try {
-        const batch = JSON.parse(decodeURIComponent(escape(atob(decodeURIComponent(encoded)))));
-        if (batch && batch.id === receiptId) {
-          return <PublicReceipt batch={batch} />;
-        }
-      } catch(e) { console.warn("Receipt decode failed", e); }
-    }
+// ─── ROOT: receipt check before any auth logic ───────────────────────────────
+export default function Root() {
+  const params = new URLSearchParams(
+    typeof window !== "undefined" ? window.location.search : ""
+  );
+  const receiptId = params.get("receipt");
+  const encoded = params.get("d");
+
+  if (receiptId && !encoded) {
+    return <PublicReceiptLoader receiptId={receiptId} />;
   }
 
+  if (receiptId && encoded) {
+    try {
+      const batch = JSON.parse(decodeURIComponent(escape(atob(decodeURIComponent(encoded)))));
+      if (batch && batch.id === receiptId) {
+        return <PublicReceipt batch={batch} />;
+      }
+    } catch(e) { console.warn("Receipt decode failed", e); }
+  }
+
+  return <App />;
+}
+
+// Loads receipt from Supabase by batch ID — no auth needed (public read via RLS)
+function PublicReceiptLoader({ receiptId }: { receiptId: string }) {
+  const [batch, setBatch] = useState<any>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!supabase) { setError("App not configured for public receipts."); return; }
+    supabase
+      .from("batches")
+      .select("*")
+      .eq("id", receiptId)
+      .single()
+      .then(({ data, error: err }) => {
+        if (err || !data) setError("Receipt not found.");
+        else setBatch(data.batch_data ?? data);
+      });
+  }, [receiptId]);
+
+  if (error) return (
+    <div style={{background:"#080D14",minHeight:"100vh",color:"#E8EDF5",display:"grid",placeItems:"center",fontFamily:"system-ui"}}>
+      <div style={{textAlign:"center",padding:32}}>
+        <div style={{fontSize:32,marginBottom:12}}>⚠️</div>
+        <div style={{fontWeight:700,marginBottom:6}}>Receipt not found</div>
+        <div style={{opacity:0.5,fontSize:13}}>{error}</div>
+      </div>
+    </div>
+  );
+  if (!batch) return (
+    <div style={{background:"#080D14",minHeight:"100vh",color:"#E8EDF5",display:"grid",placeItems:"center",fontFamily:"system-ui"}}>
+      <div style={{opacity:0.6}}>Loading receipt…</div>
+    </div>
+  );
+  return <PublicReceipt batch={batch} />;
+}
+
+function App() {
+  // ─── AUTH (Supabase) ───────────────────────────────────────────────────────
+  const [session, setSession] = useState<Session | null>(null);
+  const [authLoading, setAuthLoading] = useState<boolean>(!!supabase);
   const [view, setView] = useState<View>("dashboard");
   const [selectedBatchId, setSelectedBatchId] = useState<string|null>(null);
   const [batches, setBatches] = useState<Batch[]>(() => loadBatches());
@@ -201,6 +276,25 @@ export default function App() {
   const [companyLibrary, setCompanyLibrary] = useState<string[]>(() => lsJson(COMPANY_KEY, DEFAULT_COMPANIES));
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [batchTab, setBatchTab] = useState<BatchStatus>("Created");
+
+  useEffect(() => {
+    if (!supabase) { setAuthLoading(false); return; }
+    let mounted = true;
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (!mounted) return;
+      if (error) console.warn("Supabase getSession error", error);
+      setSession(data.session ?? null);
+      setAuthLoading(false);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, next) => {
+      if (!mounted) return;
+      setSession(next);
+    });
+    return () => {
+      mounted = false;
+      sub.subscription.unsubscribe();
+    };
+  }, []);
 
   useEffect(() => { saveBatches(batches); }, [batches]);
   useEffect(() => { lsSet(SPECIES_KEY, JSON.stringify(speciesLibrary)); }, [speciesLibrary]);
@@ -212,8 +306,21 @@ export default function App() {
     setTimeout(()=>setToasts(p=>p.filter(t=>t.id!==id)),3000);
   },[]);
 
-  const createBatch = useCallback((b: Batch) => { setBatches(p=>[b,...p]); addToast("success","Docket created"); },[addToast]);
-  const updateBatch = useCallback((id: string, updates: Partial<Batch>) => { setBatches(p=>p.map(b=>b.id===id?{...b,...updates,updatedAt:nowISO()}:b)); },[]);
+  const createBatch = useCallback((b: Batch) => {
+    setBatches(p=>[b,...p]);
+    addToast("success","Docket created");
+    if (session?.user?.id) syncBatchToSupabase(b, session.user.id);
+  },[addToast, session]);
+
+  const updateBatch = useCallback((id: string, updates: Partial<Batch>) => {
+    setBatches(p=>p.map(b=>{
+      if (b.id !== id) return b;
+      const updated = {...b,...updates,updatedAt:nowISO()};
+      if (session?.user?.id) syncBatchToSupabase(updated, session.user.id);
+      return updated;
+    }));
+  },[session]);
+
   const deleteBatch = useCallback((id: string) => { setBatches(p=>p.filter(b=>b.id!==id)); setView("batches"); addToast("info","Deleted"); },[addToast]);
   const archiveBatch = useCallback((id: string) => { updateBatch(id,{archived:true,status:"Archived"}); addToast("success","Archived"); },[updateBatch,addToast]);
   const unarchiveBatch = useCallback((id: string) => { updateBatch(id,{archived:false,status:"Created"}); addToast("success","Unarchived"); },[updateBatch,addToast]);
@@ -234,22 +341,30 @@ export default function App() {
     archived: archivedBatches.length,
   }),[activeBatches,completedBatches,archivedBatches]);
 
+  if (supabase && (authLoading || !session)) {
+    return authLoading ? (
+      <div style={{...S.app, display:"grid", placeItems:"center", minHeight:"100vh"}}>
+        <div style={{opacity:0.5}}>Loading…</div>
+      </div>
+    ) : <AuthScreen />;
+  }
+
   return (
     <div style={S.app}>
       <ToastBar toasts={toasts} />
-      <Header view={view} setView={setView} closeBatch={closeBatch} stats={stats} />
+      <Header view={view} setView={setView} closeBatch={closeBatch} stats={stats} session={session} />
       <div style={S.container}>
         {view==="dashboard" && <Dashboard stats={stats} setView={setView} />}
         {view==="batches" && <BatchesView batches={filteredBatches} tab={batchTab} setTab={setBatchTab} openBatch={openBatch} deleteBatch={deleteBatch} />}
         {view==="inbound" && <CreateDocketView batchType="inbound" createBatch={createBatch} speciesLibrary={speciesLibrary} companyLibrary={companyLibrary} addToast={addToast} setView={setView} />}
         {view==="outbound" && <CreateDocketView batchType="outbound" createBatch={createBatch} speciesLibrary={speciesLibrary} companyLibrary={companyLibrary} addToast={addToast} setView={setView} />}
-        {view==="batch" && selectedBatch && <BatchDetail batch={selectedBatch} updateBatch={updateBatch} deleteBatch={deleteBatch} archiveBatch={archiveBatch} unarchiveBatch={unarchiveBatch} closeBatch={closeBatch} addToast={addToast} speciesLibrary={speciesLibrary} companyLibrary={companyLibrary} />}
+        {view==="batch" && selectedBatch && <BatchDetail batch={selectedBatch} updateBatch={updateBatch} deleteBatch={deleteBatch} archiveBatch={archiveBatch} unarchiveBatch={unarchiveBatch} closeBatch={closeBatch} addToast={addToast} speciesLibrary={speciesLibrary} companyLibrary={companyLibrary} session={session} />}
         {view==="batch" && !selectedBatch && <div style={{padding:32}}><h2>Batch not found</h2><button style={{...S.btn,...S.btnSecondary,marginTop:16}} onClick={()=>setView("dashboard")}>Back to Dashboard</button></div>}
         {view==="eow" && <EOWView batches={completedBatches} openBatch={openBatch} />}
         {view==="archive" && <ArchiveView batches={archivedBatches} openBatch={openBatch} unarchiveBatch={unarchiveBatch} />}
         {view==="species" && <LibraryView title="Species Library" items={speciesLibrary} setItems={setSpeciesLibrary} addToast={addToast} />}
         {view==="companies" && <LibraryView title="Company Library" items={companyLibrary} setItems={setCompanyLibrary} addToast={addToast} />}
-        {view==="settings" && <SettingsView addToast={addToast} />}
+        {view==="settings" && <SettingsView addToast={addToast} session={session} />}
       </div>
     </div>
   );
@@ -269,8 +384,11 @@ function ToastBar({toasts}:{toasts:Toast[]}) {
 }
 
 // ─── HEADER ───────────────────────────────────────────────────────────────────
-function Header({view,setView,closeBatch,stats}:any) {
+function Header({view,setView,closeBatch,stats,session}:any) {
   const nav = (v: View) => { closeBatch(); setView(v); };
+  const logout = async () => {
+    if (supabase) await supabase.auth.signOut();
+  };
   return (
     <div style={S.header}>
       <div style={{display:"flex",alignItems:"center",gap:20}}>
@@ -280,6 +398,12 @@ function Header({view,setView,closeBatch,stats}:any) {
         {([["dashboard","Dashboard"],["batches",`Batches (${stats.total})`],["inbound","Create Inbound"],["outbound","Create Outbound"],["eow",`EOW (${stats.completed})`],["archive",`Archive (${stats.archived})`],["species","Species"],["companies","Companies"],["settings","Settings"]] as [View,string][]).map(([v,label])=>(
           <button key={v} style={{...S.navBtn,...(view===v?S.navBtnActive:{})}} onClick={()=>nav(v)}>{label}</button>
         ))}
+        {session && (
+          <div style={{display:"flex",alignItems:"center",gap:8,marginLeft:8,paddingLeft:12,borderLeft:"1px solid rgba(255,255,255,0.1)"}}>
+            <span style={{fontSize:11,opacity:0.55,maxWidth:160,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{session.user?.email}</span>
+            <button style={{...S.btn,...S.btnDanger,fontSize:11,padding:"5px 10px"}} onClick={logout}>Logout</button>
+          </div>
+        )}
       </nav>
     </div>
   );
@@ -491,12 +615,14 @@ function CreateDocketView({batchType,createBatch,speciesLibrary,companyLibrary,a
 }
 
 // ─── BATCH DETAIL ─────────────────────────────────────────────────────────────
-function BatchDetail({batch,updateBatch,deleteBatch,archiveBatch,unarchiveBatch,closeBatch,addToast,speciesLibrary,companyLibrary}:any) {
+function BatchDetail({batch,updateBatch,deleteBatch,archiveBatch,unarchiveBatch,closeBatch,addToast,speciesLibrary,companyLibrary,session}:any) {
   const [landingCertNo,setLandingCertNo] = useState(batch.landingCertNo||"");
   const [processingCertNo,setProcessingCertNo] = useState(batch.processingCertNo||"");
   const [catchCertNo,setCatchCertNo] = useState(batch.catchCertNo||"");
   const [healthCertNo,setHealthCertNo] = useState(batch.healthCertNo||"");
   const [transportLegs,setTransportLegs] = useState<TransportLeg[]>(batch.transportLegs||[]);
+  const [publishing, setPublishing] = useState(false);
+  const [published, setPublished] = useState(false);
 
   const saveCerts = () => {
     updateBatch(batch.id,{landingCertNo,processingCertNo,catchCertNo,healthCertNo,transportLegs});
@@ -508,7 +634,24 @@ function BatchDetail({batch,updateBatch,deleteBatch,archiveBatch,unarchiveBatch,
   const updateLeg = (i:number,f:keyof TransportLeg,v:string) => setTransportLegs(p=>p.map((l,idx)=>idx===i?{...l,[f]:v}:l));
 
   const encoded = encodeBatch({...batch,landingCertNo,processingCertNo,catchCertNo,healthCertNo,transportLegs});
-  const publicUrl = `${RESOLVER_BASE}/?receipt=${batch.id}&d=${encoded}`;
+  const base = String(PUBLIC_BASE_URL).replace(/\/$/, '');
+  if (!base) {
+    console.warn("VITE_PUBLIC_BASE_URL is not set. QR codes require a public domain.");
+  }
+  const shortUrl = `${base}/?receipt=${encodeURIComponent(batch.id)}`;
+  const legacyUrl = `${base}/?receipt=${encodeURIComponent(batch.id)}&d=${encoded}`;
+
+  const publishReceipt = async () => {
+    setPublishing(true);
+    try {
+      saveCerts();
+      await new Promise(r => setTimeout(r, 300));
+      setPublished(true);
+      addToast("success", "Receipt published — QR code is live");
+    } finally {
+      setPublishing(false);
+    }
+  };
 
   return (
     <div style={S.card}>
@@ -583,18 +726,15 @@ function BatchDetail({batch,updateBatch,deleteBatch,archiveBatch,unarchiveBatch,
         </div>
         {transportLegs.length===0 && <p style={{...S.small,opacity:0.4,marginBottom:16}}>No transport legs added yet.</p>}
         {transportLegs.map((leg,i)=>(
-          <div key={i} style={{...S.subCard,marginBottom:10}}>
-            <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
-              <span style={{fontSize:12,fontWeight:700,opacity:0.6}}>Leg {i+1}</span>
-              <button style={{...S.btn,...S.btnDanger,fontSize:11,padding:"3px 8px"}} onClick={()=>removeLeg(i)}>Remove</button>
-            </div>
-            <div style={S.formGrid}>
-              <div><label style={S.label}>Transport Company</label><input list="co-list2" style={S.input} value={leg.transportCompany} onChange={e=>updateLeg(i,"transportCompany",e.target.value)} /><datalist id="co-list2">{companyLibrary.map((c:string)=><option key={c} value={c}/>)}</datalist></div>
-              <div><label style={S.label}>Vehicle Reg</label><input style={S.input} value={leg.vehicleReg} onChange={e=>updateLeg(i,"vehicleReg",e.target.value)} /></div>
-              <div><label style={S.label}>Handover Time</label><input type="datetime-local" style={S.input} value={leg.handoverTime?.slice(0,16)||""} onChange={e=>updateLeg(i,"handoverTime",e.target.value)} /></div>
-              <div><label style={S.label}>Notes</label><input style={S.input} value={leg.notes||""} onChange={e=>updateLeg(i,"notes",e.target.value)} /></div>
-            </div>
-          </div>
+          <TransportLegCard
+            key={i}
+            leg={leg}
+            index={i}
+            companyLibrary={companyLibrary}
+            session={session}
+            onUpdate={(f,v)=>updateLeg(i,f,v)}
+            onRemove={()=>removeLeg(i)}
+          />
         ))}
 
         <button style={{...S.btn,...S.btnPrimary,width:"100%",marginBottom:16}} onClick={saveCerts}>Save Certs & Transport</button>
@@ -609,11 +749,25 @@ function BatchDetail({batch,updateBatch,deleteBatch,archiveBatch,unarchiveBatch,
         {/* QR Code */}
         <div>
           <h3 style={{fontSize:13,fontWeight:800,marginBottom:12,opacity:0.7,textTransform:"uppercase" as const,letterSpacing:1}}>QR Code — Receipt</h3>
+          {supabase ? (
+            <div style={{marginBottom:14}}>
+              <button
+                style={{...S.btn,...S.btnPrimary,width:"100%",fontSize:14,padding:"12px"}}
+                onClick={publishReceipt}
+                disabled={publishing}
+              >
+                {publishing ? "Publishing…" : published ? "✓ Published — Re-publish to update" : "📤 Publish Receipt (enables QR scan)"}
+              </button>
+              <p style={{...S.small,marginTop:6,opacity:0.5}}>This saves the receipt to the cloud so anyone scanning the QR code can view it without logging in.</p>
+            </div>
+          ) : (
+            <p style={{...S.small,marginBottom:10,color:"#FCA5A5"}}>⚠️ Supabase not configured — QR will use long URL (may not scan on all phones)</p>
+          )}
           <div style={{background:"#fff",padding:16,borderRadius:12,display:"inline-block",marginBottom:10}}>
-            <QRCodeSVG value={publicUrl} size={160} />
+            <QRCodeSVG value={supabase ? shortUrl : legacyUrl} size={180} />
           </div>
           <p style={{...S.small,marginTop:6}}>Scan to view receipt on any device</p>
-          <p style={{...S.small,marginTop:4,opacity:0.5,wordBreak:"break-all" as const,fontSize:11}}>{publicUrl}</p>
+          <p style={{...S.small,marginTop:4,opacity:0.5,wordBreak:"break-all" as const,fontSize:11}}>{supabase ? shortUrl : legacyUrl}</p>
         </div>
       </div>
     </div>
@@ -705,24 +859,321 @@ function LibraryView({title,items,setItems,addToast}:any) {
 }
 
 // ─── SETTINGS ─────────────────────────────────────────────────────────────────
-function SettingsView({addToast}:any) {
+
+function AuthScreen() {
+  const [mode, setMode] = useState<"login" | "signup">("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [signupDone, setSignupDone] = useState(false);
+
+  const submit = async () => {
+    if (!supabase) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      if (mode === "login") {
+        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+      } else {
+        const { error } = await supabase.auth.signUp({ email, password });
+        if (error) throw error;
+        setSignupDone(true);
+      }
+    } catch (e: any) {
+      setErr(e?.message || "Auth failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={S.app}>
+      <div style={{ ...S.container, display: "grid", placeItems: "center", minHeight: "100vh" }}>
+        <div style={{ ...S.card, maxWidth: 420, width: "100%" }}>
+          <div style={S.cardPad}>
+            <div style={{textAlign:"center",marginBottom:24}}>
+              <img src={LOGO_URL} alt={APP_NAME} style={{height:64,borderRadius:12,objectFit:"contain",marginBottom:12}} />
+              <h1 style={{fontSize:20,fontWeight:900,marginBottom:4}}>Batch ID Pro</h1>
+              <p style={{...S.small,opacity:0.5}}>Sign in to access your company's batches</p>
+            </div>
+
+            {signupDone ? (
+              <div style={{textAlign:"center",padding:"16px 0"}}>
+                <div style={{fontSize:32,marginBottom:8}}>📧</div>
+                <p style={{fontWeight:700,marginBottom:6}}>Check your email</p>
+                <p style={{...S.small,opacity:0.6,marginBottom:16}}>We've sent a confirmation link to {email}. Click it to activate your account, then come back here to log in.</p>
+                <button style={{...S.btn,...S.btnSecondary,width:"100%"}} onClick={()=>{setSignupDone(false);setMode("login");}}>Back to Login</button>
+              </div>
+            ) : (
+              <div style={{ display: "grid", gap: 10 }}>
+                <div style={{display:"flex",gap:6,marginBottom:4}}>
+                  {(["login","signup"] as const).map(m=>(
+                    <button key={m} style={{...S.btn,flex:1,...(mode===m?S.btnPrimary:{...S.btnSecondary})}} onClick={()=>{setMode(m);setErr(null);}}>
+                      {m==="login"?"Sign In":"Create Account"}
+                    </button>
+                  ))}
+                </div>
+                <input style={S.input} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" type="email" autoComplete="email" />
+                <input style={S.input} type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" autoComplete={mode==="login"?"current-password":"new-password"} onKeyDown={e=>e.key==="Enter"&&submit()} />
+                {err && <div style={{ ...S.small, color: "#FCA5A5", padding:"8px 12px", background:"rgba(239,68,68,0.1)", borderRadius:8 }}>{err}</div>}
+                <button style={{ ...S.btn, ...S.btnPrimary, fontSize:14, padding:"12px" }} disabled={busy || !email || !password} onClick={submit}>
+                  {busy ? "Working…" : mode === "login" ? "Sign In" : "Create Account"}
+                </button>
+                {mode==="signup" && (
+                  <p style={{ ...S.small, opacity: 0.45, textAlign:"center" }}>
+                    Each company gets their own account. Your data is private and isolated.
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ─── TRANSPORT LEG CARD (with reg photo upload) ───────────────────────────────
+function TransportLegCard({leg, index, companyLibrary, session, onUpdate, onRemove}: any) {
+  const [uploading, setUploading] = useState(false);
+
+  const fileToDataUrl = (f: File) =>
+    new Promise<string>((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result || ""));
+      r.onerror = () => reject(new Error("Failed to read file"));
+      r.readAsDataURL(f);
+    });
+
+  const handlePhoto = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    try {
+      let photoUrl: string;
+      if (supabase && session?.user?.id) {
+        const ext = file.name.split(".").pop() || "jpg";
+        const path = `${session.user.id}/leg-${Date.now()}.${ext}`;
+        const up = await supabase.storage.from("vehicle-photos").upload(path, file, { upsert: true });
+        if (!up.error) {
+          const { data } = supabase.storage.from("vehicle-photos").getPublicUrl(path);
+          photoUrl = data.publicUrl;
+        } else {
+          photoUrl = await fileToDataUrl(file);
+        }
+      } else {
+        photoUrl = await fileToDataUrl(file);
+      }
+      onUpdate("regPhotoUrl", photoUrl);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  return (
+    <div style={{...S.subCard, marginBottom:10}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+        <span style={{fontSize:12,fontWeight:700,opacity:0.6}}>Leg {index+1}</span>
+        <button style={{...S.btn,...S.btnDanger,fontSize:11,padding:"3px 8px"}} onClick={onRemove}>Remove</button>
+      </div>
+      <div style={S.formGrid}>
+        <div>
+          <label style={S.label}>Transport Company</label>
+          <input list="co-list2" style={S.input} value={leg.transportCompany} onChange={e=>onUpdate("transportCompany",e.target.value)} />
+          <datalist id="co-list2">{companyLibrary.map((c:string)=><option key={c} value={c}/>)}</datalist>
+        </div>
+        <div>
+          <label style={S.label}>Vehicle Reg</label>
+          <input list={`veh-list-${index}`} style={S.input} value={leg.vehicleReg} onChange={e=>onUpdate("vehicleReg",e.target.value)} />
+          <datalist id={`veh-list-${index}`}>{lsJson<VehicleReg[]>(VEHICLES_KEY, []).map(v=><option key={v.id} value={v.registration} />)}</datalist>
+        </div>
+        <div>
+          <label style={S.label}>Handover Time</label>
+          <input type="datetime-local" style={S.input} value={leg.handoverTime?.slice(0,16)||""} onChange={e=>onUpdate("handoverTime",e.target.value)} />
+        </div>
+        <div>
+          <label style={S.label}>Notes</label>
+          <input style={S.input} value={leg.notes||""} onChange={e=>onUpdate("notes",e.target.value)} />
+        </div>
+      </div>
+      {/* Reg plate photo */}
+      <div style={{marginTop:10}}>
+        <label style={S.label}>📷 Reg Plate Photo</label>
+        <input
+          style={{...S.input, cursor:"pointer"}}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          onChange={handlePhoto}
+          disabled={uploading}
+        />
+        {uploading && <p style={{...S.small,marginTop:4,opacity:0.6}}>Uploading…</p>}
+        {leg.regPhotoUrl && (
+          <div style={{marginTop:8}}>
+            <img
+              src={leg.regPhotoUrl}
+              alt="Reg plate"
+              style={{maxWidth:320,width:"100%",borderRadius:10,border:"1px solid rgba(255,255,255,0.1)"}}
+            />
+            <button
+              style={{...S.btn,...S.btnDanger,fontSize:11,padding:"4px 10px",marginTop:6}}
+              onClick={()=>onUpdate("regPhotoUrl","")}
+            >Remove photo</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+function VehicleRegistry({ session, vehiclesKey }: { session: any; vehiclesKey: string }) {
+  const [vehicles, setVehicles] = useState<VehicleReg[]>(() => lsJson<VehicleReg[]>(vehiclesKey, []));
+  const [registration, setRegistration] = useState("");
+  const [entry, setEntry] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const persist = (next: VehicleReg[]) => {
+    setVehicles(next);
+    lsSet(vehiclesKey, JSON.stringify(next));
+  };
+
+  const fileToDataUrl = (f: File) =>
+    new Promise<string>((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result || ""));
+      r.onerror = () => reject(new Error("Failed to read file"));
+      r.readAsDataURL(f);
+    });
+
+  const addVehicle = async () => {
+    const reg = registration.trim().toUpperCase();
+    if (!reg) return;
+
+    setBusy(true);
+    try {
+      const id = crypto?.randomUUID ? crypto.randomUUID() : String(Date.now());
+      let photoUrl: string | undefined;
+
+      if (file) {
+        if (supabase && session?.user?.id) {
+          // Try Supabase storage first
+          const ext = file.name.split(".").pop() || "jpg";
+          const path = `${session.user.id}/${id}.${ext}`;
+          const up = await supabase.storage.from("vehicle-photos").upload(path, file, { upsert: true });
+          if (!up.error) {
+            const { data } = supabase.storage.from("vehicle-photos").getPublicUrl(path);
+            photoUrl = data.publicUrl;
+          } else {
+            // Fallback to local data url
+            photoUrl = await fileToDataUrl(file);
+          }
+        } else {
+          photoUrl = await fileToDataUrl(file);
+        }
+      }
+
+      const next: VehicleReg[] = [{ id, registration: reg, entry: entry.trim() || undefined, photoUrl }, ...vehicles];
+      persist(next);
+
+      setRegistration("");
+      setEntry("");
+      setFile(null);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeVehicle = (id: string) => {
+    persist(vehicles.filter(v => v.id !== id));
+  };
+
+  return (
+    <div style={{...S.subCard}}>
+      <div style={{display:"grid", gap:10, maxWidth:520}}>
+        <div>
+          <label style={S.label}>Registration</label>
+          <input style={S.input} value={registration} onChange={e=>setRegistration(e.target.value)} placeholder="e.g. AB12 CDE" />
+        </div>
+        <div>
+          <label style={S.label}>Entry / Notes</label>
+          <input style={S.input} value={entry} onChange={e=>setEntry(e.target.value)} placeholder="Optional" />
+        </div>
+        <div>
+          <label style={S.label}>Vehicle reg photo</label>
+          <input style={S.input} type="file" accept="image/*" onChange={e=>setFile(e.target.files?.[0] || null)} />
+          <p style={{...S.small, marginTop:6, opacity:0.55}}>
+            {supabase && session ? "Supabase: upload to bucket vehicle-photos." : "Local fallback: saved in browser storage."}
+          </p>
+        </div>
+        <button style={{...S.btn,...S.btnPrimary}} disabled={busy || !registration.trim()} onClick={addVehicle}>
+          {busy ? "Saving..." : "Add Vehicle"}
+        </button>
+      </div>
+
+      <div style={{marginTop:14, display:"grid", gap:10}}>
+        {vehicles.length === 0 && <div style={{...S.small, opacity:0.5}}>No vehicles added yet.</div>}
+        {vehicles.map(v => (
+          <div key={v.id} style={{padding:10, border:"1px solid rgba(255,255,255,0.06)", borderRadius:12}}>
+            <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", gap:10}}>
+              <div>
+                <div style={{fontWeight:800}}>{v.registration}</div>
+                {v.entry && <div style={{...S.small, opacity:0.65, marginTop:2}}>{v.entry}</div>}
+              </div>
+              <button style={{...S.btn,...S.btnDanger, fontSize:11, padding:"6px 10px"}} onClick={()=>removeVehicle(v.id)}>Remove</button>
+            </div>
+            {v.photoUrl && (
+              <div style={{marginTop:10}}>
+                <img src={v.photoUrl} alt="Vehicle reg" style={{maxWidth:320, width:"100%", borderRadius:10, border:"1px solid rgba(255,255,255,0.06)"}} />
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SettingsView({addToast, session}:any) {
   const [ourCompany,setOurCompany] = useState(ls(OUR_COMPANY_KEY));
   const save = () => { lsSet(OUR_COMPANY_KEY,ourCompany.trim()); addToast("success","Settings saved"); };
   return (
     <div style={S.card}>
       <div style={S.cardPad}>
         <h2 style={{...S.h2,marginBottom:16}}>Settings</h2>
+        {/* Auth status / Logout */}
+        <div style={{marginBottom:16, display:"flex", alignItems:"center", justifyContent:"space-between", gap:10, flexWrap:"wrap"}}>
+          <div style={{...S.small, opacity:0.65}}>
+            {supabase ? (session ? "Signed in" : "Not signed in") : "Supabase not configured"}
+          </div>
+          {supabase && session && (
+            <button
+              style={{...S.btn, ...S.btnSecondary}}
+              onClick={async ()=>{ try { await supabase.auth.signOut(); addToast("success","Logged out"); } catch(e:any){ addToast("error", e?.message || "Logout failed"); } }}
+            >
+              Logout
+            </button>
+          )}
+        </div>
+
         <div style={{marginBottom:16}}>
           <label style={S.label}>Your Company Name</label>
           <input style={S.input} value={ourCompany} onChange={e=>setOurCompany(e.target.value)} placeholder="e.g. Portavogie Fish Co." />
           <p style={{...S.small,marginTop:6,opacity:0.5}}>Used to auto-fill the "From" or "To" field when creating dockets.</p>
         </div>
-        <div style={{marginBottom:16,padding:12,background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:10,fontSize:13}}>
-          <strong>Resolver URL:</strong><br/>
-          <span style={{fontFamily:"monospace",fontSize:11,opacity:0.6}}>{RESOLVER_BASE}/b/:batchId</span><br/>
-          <p style={{marginTop:6,opacity:0.5,fontSize:12}}>QR codes point here. Your resolver project must be deployed at this domain.</p>
+        
+        {/* Vehicle Registry */}
+        <div style={{marginTop:22}}>
+          <h3 style={{fontSize:13,fontWeight:800,marginBottom:12,opacity:0.7,textTransform:"uppercase" as const,letterSpacing:1}}>Vehicle Registry</h3>
+
+          <VehicleRegistry session={session} vehiclesKey={VEHICLES_KEY} />
         </div>
-        <button style={{...S.btn,...S.btnPrimary}} onClick={save}>Save Settings</button>
+
+<button style={{...S.btn,...S.btnPrimary}} onClick={save}>Save Settings</button>
       </div>
     </div>
   );
