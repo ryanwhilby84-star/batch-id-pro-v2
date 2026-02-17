@@ -1,4 +1,4 @@
-// Batch ID Pro — Single-File App (V1.1 — CONFIRM + LOCK + QR RECEIPT CONFIRM + LOGOUT + (OPTIONAL) SUPABASE)
+// Batch ID Pro — Single-File App (V1.1 — CONFIRM + LOCK + QR RECEIPT CONFIRM + LOGOUT + SUPABASE)
 // QR codes point to resolver at https://batch.coresystemsni.com/?receipt=ID&d=ENCODED
 // No router. Vite + React. TypeScript-safe.
 //
@@ -56,25 +56,12 @@ const LOGO_URL =
   "https://res.cloudinary.com/dmnuqcykq/image/upload/v1770027904/ChatGPT_Image_Feb_2_2026_10_24_54_AM_f99qva.png";
 const APP_NAME = "Batch ID Pro";
 
-// ─── SUPABASE (OPTIONAL) ─────────────────────────────────────────────────────
+// ─── SUPABASE (CONFIGURED) ───────────────────────────────────────────────────
 const SUPABASE_URL = (import.meta as any).env?.VITE_SUPABASE_URL as string | undefined;
 const SUPABASE_ANON = (import.meta as any).env?.VITE_SUPABASE_ANON_KEY as string | undefined;
 
 const supabase =
   SUPABASE_URL && SUPABASE_ANON ? createClient(SUPABASE_URL, SUPABASE_ANON, { auth: { persistSession: true } }) : null;
-
-// Table expected (minimal):
-// batches:
-//  - id (text primary key)
-//  - data (jsonb)   // full batch object
-//  - status (text)
-//  - batch_type (text)
-//  - from_company (text)
-//  - to_company (text)
-//  - sent_at (timestamptz null)
-//  - received_at (timestamptz null)
-//  - locked (bool default false)
-//  - updated_at (timestamptz default now())
 
 // ─── TYPES ───────────────────────────────────────────────────────────────────
 type BatchType = "inbound" | "outbound";
@@ -122,10 +109,9 @@ interface Batch {
   landingPort?: string;
   processingPlant?: string;
 
-  // NEW: workflow timestamps + lock
-  sentAt?: string; // when shipment confirmed (outbound)
-  receivedAt?: string; // when recipient confirms (external)
-  locked?: boolean; // true once "In Transit" (or completed) to prevent changes
+  sentAt?: string;
+  receivedAt?: string;
+  locked?: boolean;
 }
 
 // ─── STORAGE ─────────────────────────────────────────────────────────────────
@@ -133,8 +119,6 @@ const STORAGE_KEY = "batchidpro_v1";
 const OUR_COMPANY_KEY = "batchidpro_ourcompany";
 const SPECIES_KEY = "batchidpro_species";
 const COMPANY_KEY = "batchidpro_companies";
-
-// optional: local "session" for non-supabase mode (basic logout)
 const LOCAL_SESSION_KEY = "batchidpro_local_session";
 
 const DEFAULT_SPECIES = [
@@ -205,7 +189,6 @@ const speciesSummary = (b: Batch) => {
   return lines.length === 1 ? lines[0].species : `${lines[0].species} +${lines.length - 1}`;
 };
 
-// Receipt data encoding (for redundancy on QR)
 function encodeBatch(batch: Batch): string {
   try {
     const d = {
@@ -292,7 +275,6 @@ async function sbFetchBatchById(id: string): Promise<{ ok: boolean; batch?: Batc
 
 async function sbConfirmReceipt(id: string): Promise<{ ok: boolean; batch?: Batch; error?: string }> {
   if (!supabase) return { ok: false, error: "Supabase not configured" };
-  // We enforce minimal rule client-side; server-side should be RLS/policy later.
   const f = await sbFetchBatchById(id);
   if (!f.ok || !f.batch) return { ok: false, error: f.error || "Not found" };
   const b = f.batch;
@@ -346,10 +328,8 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
       setErr("");
       setDone(false);
 
-      // 1) Try encoded payload first (instant render)
       const okEncoded = setFromEncoded();
 
-      // 2) If Supabase configured, fetch live record so confirm receipt works
       if (supabase) {
         const f = await sbFetchBatchById(receiptId);
         if (mounted) {
@@ -360,7 +340,6 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
           }
         }
       } else {
-        // No Supabase; if encoded failed, we can’t do anything.
         if (mounted && !okEncoded)
           setErr("Receipt link incomplete (missing encoded data) and no online database configured.");
       }
@@ -527,8 +506,8 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
               <>
                 <div style={{ fontWeight: 800, marginBottom: 8 }}>Online confirmation is not enabled on this build.</div>
                 <div className="hint">
-                  This receipt page is running on a different device. Without Supabase (or another database), it cannot update the sender’s system.
-                  Enable Supabase to make “Confirm Receipt” update the batch instantly.
+                  This receipt page is running on a different device. Without Supabase (or another database), it cannot update the sender's system.
+                  Enable Supabase to make "Confirm Receipt" update the batch instantly.
                 </div>
               </>
             ) : (
@@ -722,7 +701,7 @@ function AuthGate({ onAuthed }: { onAuthed: (session: Session) => void }) {
 
             <div style={{ fontSize: 12, opacity: 0.55, lineHeight: 1.5 }}>
               <b>Multi-user on one account:</b> If you want multiple staff to use one company account, simply share this login internally.
-              If/when you want true multi-user memberships per company, we’ll add a membership table + RLS later.
+              If/when you want true multi-user memberships per company, we'll add a membership table + RLS later.
             </div>
           </div>
         </div>
@@ -733,9 +712,6 @@ function AuthGate({ onAuthed }: { onAuthed: (session: Session) => void }) {
 
 // ─── MAIN APP ────────────────────────────────────────────────────────────────
 export default function App() {
-  // ── Receipt route detection ──
-  // QR codes encode: https://batch.coresystemsni.com/?receipt=ID&d=ENCODED
-  // If ?receipt= is present, render receipt page (external docket).
   if (typeof window !== "undefined") {
     const params = new URLSearchParams(window.location.search);
     const receiptId = params.get("receipt");
@@ -745,7 +721,6 @@ export default function App() {
 
   const [session, setSession] = useState<Session | null>(null);
 
-  // Supabase auth listener
   useEffect(() => {
     if (!supabase) return;
     let mounted = true;
@@ -765,12 +740,10 @@ export default function App() {
     };
   }, []);
 
-  // If Supabase configured, require auth.
   if (supabase && !session) {
     return <AuthGate onAuthed={(s) => setSession(s)} />;
   }
 
-  // Basic local "session" for non-supabase mode (optional logout button)
   const [localSession, setLocalSession] = useState(() => lsGet(LOCAL_SESSION_KEY) || "ok");
   useEffect(() => {
     if (!supabase) lsSet(LOCAL_SESSION_KEY, localSession || "ok");
@@ -786,7 +759,6 @@ export default function App() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [batchTab, setBatchTab] = useState<BatchStatus>("Created");
 
-  // Persist local batches
   useEffect(() => {
     saveBatches(batches);
   }, [batches]);
@@ -805,7 +777,6 @@ export default function App() {
     setTimeout(() => setToasts((p) => p.filter((t) => t.id !== id)), 3200);
   }, []);
 
-  // Optional: Pull latest from Supabase at startup (keeps local in sync)
   useEffect(() => {
     if (!supabase || !session) return;
     let mounted = true;
@@ -847,7 +818,6 @@ export default function App() {
       setBatches((p) => p.map((b) => (b.id === id ? { ...b, ...updates, updatedAt: nowISO() } : b)));
 
       if (supabase && session) {
-        // read latest from state is async; reconstruct best effort
         const current = batches.find((x) => x.id === id);
         const merged = current ? ({ ...current, ...updates, updatedAt: nowISO() } as Batch) : null;
         if (merged) {
@@ -919,7 +889,6 @@ export default function App() {
     setView("batches");
   }, []);
 
-  // Tabs and filters
   const activeBatches = useMemo(
     () => batches.filter((b) => !b.archived && (b.status === "Created" || b.status === "In Transit")),
     [batches]
@@ -947,7 +916,6 @@ export default function App() {
     [activeBatches, completedBatches, archivedBatches]
   );
 
-  // LOGOUT
   const doLogout = useCallback(async () => {
     setSelectedBatchId(null);
     setView("dashboard");
@@ -957,7 +925,6 @@ export default function App() {
       return;
     }
 
-    // local-only logout just resets “session”
     lsDel(LOCAL_SESSION_KEY);
     setLocalSession("ok");
     addToast("info", "Logged out");
@@ -1012,7 +979,6 @@ export default function App() {
   );
 }
 
-// ─── TOAST ────────────────────────────────────────────────────────────────────
 function ToastBar({ toasts }: { toasts: Toast[] }) {
   return (
     <div style={{ position: "fixed", bottom: 16, right: 16, zIndex: 1000, display: "flex", flexDirection: "column", gap: 8 }}>
@@ -1036,7 +1002,6 @@ function ToastBar({ toasts }: { toasts: Toast[] }) {
   );
 }
 
-// ─── HEADER ───────────────────────────────────────────────────────────────────
 function Header({ view, setView, closeBatch, stats, onLogout, showLogout }: any) {
   const nav = (v: View) => {
     closeBatch();
@@ -1077,7 +1042,6 @@ function Header({ view, setView, closeBatch, stats, onLogout, showLogout }: any)
   );
 }
 
-// ─── DASHBOARD ────────────────────────────────────────────────────────────────
 function Dashboard({ stats, setView }: any) {
   return (
     <div>
@@ -1116,7 +1080,6 @@ function Dashboard({ stats, setView }: any) {
   );
 }
 
-// ─── BATCHES VIEW (Created/In Transit) ───────────────────────────────────────
 function BatchesView({ batches, tab, setTab, openBatch, deleteBatch }: any) {
   return (
     <div>
@@ -1175,7 +1138,6 @@ function BatchesView({ batches, tab, setTab, openBatch, deleteBatch }: any) {
   );
 }
 
-// ─── OUTBOUND SENT VIEW ───────────────────────────────────────────────────────
 function OutboundSentView({ batches, openBatch }: any) {
   const outbound = (batches as Batch[]).filter((b) => b.batchType === "outbound" && !b.archived);
   const sent = outbound.filter((b) => b.status === "In Transit" || b.status === "Completed");
@@ -1217,7 +1179,6 @@ function OutboundSentView({ batches, openBatch }: any) {
   );
 }
 
-// ─── CREATE DOCKET ────────────────────────────────────────────────────────────
 function CreateDocketView({ batchType, createBatch, speciesLibrary, companyLibrary, addToast, setView }: any) {
   const isInbound = batchType === "inbound";
   const ourCompany = lsGet(OUR_COMPANY_KEY);
@@ -1416,7 +1377,7 @@ function CreateDocketView({ batchType, createBatch, speciesLibrary, companyLibra
             Create Docket (Draft)
           </button>
           <div style={{ ...S.small, marginTop: 10, opacity: 0.55 }}>
-            Draft only. For outbound, you must <b>Confirm Shipment</b> inside the batch before it becomes “Sent / In Transit”.
+            Draft only. For outbound, you must <b>Confirm Shipment</b> inside the batch before it becomes "Sent / In Transit".
           </div>
         </div>
       </div>
@@ -1424,7 +1385,6 @@ function CreateDocketView({ batchType, createBatch, speciesLibrary, companyLibra
   );
 }
 
-// ─── BATCH DETAIL ─────────────────────────────────────────────────────────────
 function BatchDetail({ batch, updateBatch, deleteBatch, archiveBatch, unarchiveBatch, closeBatch, addToast, speciesLibrary, companyLibrary }: any) {
   void speciesLibrary;
 
@@ -1696,7 +1656,6 @@ function KV({ label, value }: { label: string; value: string }) {
   );
 }
 
-// ─── EOW VIEW ─────────────────────────────────────────────────────────────────
 function EOWView({ batches, openBatch }: any) {
   const totalWeight = round2(batches.reduce((a: number, b: Batch) => a + totalKg(b), 0));
   return (
@@ -1730,7 +1689,6 @@ function EOWView({ batches, openBatch }: any) {
   );
 }
 
-// ─── ARCHIVE VIEW ─────────────────────────────────────────────────────────────
 function ArchiveView({ batches, openBatch, unarchiveBatch }: any) {
   return (
     <div>
@@ -1764,7 +1722,6 @@ function ArchiveView({ batches, openBatch, unarchiveBatch }: any) {
   );
 }
 
-// ─── LIBRARY VIEW ─────────────────────────────────────────────────────────────
 function LibraryView({ title, items, setItems, addToast }: any) {
   const [newItem, setNewItem] = useState("");
 
@@ -1827,7 +1784,6 @@ function LibraryView({ title, items, setItems, addToast }: any) {
   );
 }
 
-// ─── SETTINGS ─────────────────────────────────────────────────────────────────
 function SettingsView({ addToast }: any) {
   const [ourCompany, setOurCompany] = useState(lsGet(OUR_COMPANY_KEY));
   const save = () => {
@@ -1849,7 +1805,7 @@ function SettingsView({ addToast }: any) {
           <strong>Resolver URL:</strong>
           <br />
           <span style={{ fontFamily: "monospace", fontSize: 11, opacity: 0.7 }}>{RESOLVER_BASE}/?receipt=ID&d=ENCODED</span>
-          <p style={{ marginTop: 6, opacity: 0.55, fontSize: 12 }}>QR codes point here. External “Confirm Receipt” requires Supabase configured.</p>
+          <p style={{ marginTop: 6, opacity: 0.55, fontSize: 12 }}>QR codes point here. External "Confirm Receipt" requires Supabase configured.</p>
         </div>
 
         <div style={{ marginBottom: 16, padding: 12, background: "rgba(59,130,246,0.08)", border: "1px solid rgba(59,130,246,0.18)", borderRadius: 10, fontSize: 13 }}>
@@ -1868,7 +1824,6 @@ function SettingsView({ addToast }: any) {
   );
 }
 
-// ─── STYLES ───────────────────────────────────────────────────────────────────
 const S = {
   app: { minHeight: "100vh", background: "#080D14", color: "#E8EDF5", fontFamily: "system-ui,sans-serif" },
   header: {
