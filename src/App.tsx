@@ -61,7 +61,14 @@ const SUPABASE_URL_RAW = (import.meta as any).env?.VITE_SUPABASE_URL as string |
 const SUPABASE_ANON_RAW = (import.meta as any).env?.VITE_SUPABASE_ANON_KEY as string | undefined;
 
 // Normalize (handles accidental quotes/whitespace/newlines) and validate early so the whole app never hard-crashes.
-const normalizeEnv = (v?: string) => (typeof v === 'string' ? v.trim().replace(/^['"]|['"]$/g, '') : undefined);
+const normalizeEnv = (v?: string) => {
+  if (typeof v !== 'string') return undefined;
+  // Trim + strip accidental wrapping quotes
+  let s = v.trim().replace(/^['"]|['"]$/g, '');
+  // Some deployments accidentally prefix the URL with "supabase:" (e.g. "supabase:https://...")
+  s = s.replace(/^supabase:\s*/i, '');
+  return s;
+};
 
 const SUPABASE_URL = normalizeEnv(SUPABASE_URL_RAW)?.replace(/\/+$/g, '');
 const SUPABASE_ANON = normalizeEnv(SUPABASE_ANON_RAW);
@@ -156,6 +163,14 @@ interface Batch {
 
 // ─── STORAGE ─────────────────────────────────────────────────────────────────
 const STORAGE_KEY = "batchidpro_v1";
+
+// Local fallback persistence (only used when Supabase is not available)
+const saveBatches = (items: any) => {
+  try {
+    lsSet(STORAGE_KEY, JSON.stringify(items ?? []));
+  } catch {}
+};
+
 const OUR_COMPANY_KEY = "batchidpro_ourcompany";
 const SPECIES_KEY = "batchidpro_species";
 const COMPANY_KEY = "batchidpro_companies";
@@ -1200,6 +1215,13 @@ export default function App() {
   const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
 
   const [batches, setBatches] = useState<Batch[]>(() => (supabase ? [] : loadBatchesLocal()));
+
+  // Persist local batches when running without Supabase
+  useEffect(() => {
+    if (supabase) return;
+    saveBatchesLocal(batches);
+  }, [batches]);
+
     // Load batches for active company (Supabase mode)
   useEffect(() => {
     if (!supabase) return;
@@ -1353,7 +1375,7 @@ const [speciesLibrary, setSpeciesLibrary] = useState<string[]>(() => lsJson(SPEC
     async (id: string) => {
       const b = batches.find((x) => x.id === id);
       if (b && b.status === "Archived") {
-        const wasSent = !!b.sentAt || b.status === "In Transit" || b.status === "Completed";
+        const wasSent = !!b.sentAt || ["In Transit", "Completed"].includes(b.status as unknown as string);
         if (wasSent) {
           addToast("error", "Sent/completed batches cannot be unarchived back into draft.");
           return;
