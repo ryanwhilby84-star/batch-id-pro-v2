@@ -1,0 +1,20 @@
+[33mfcdf0c8[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m)[m WIP run from this morning
+[33m357eab3[m BatchID Pro V1 — fix batches 400 error, remove on_conflict upsert, stable create flow
+[33m47b11b3[m Fix build syntax error (sbFetchBatchById)
+[33m25bbd75[m Fix batches 400s (schema-safe load + upsert fallbacks)
+[33m31a8a2d[m Fix React hook order (no early returns before hooks)
+[33mca2a634[m Fix React hooks order crash (receipt route)
+[33m0707951[m Fix no-company onboarding + auth flow
+[33mb662dac[m Fix RLS company creation + auth flow
+[33mfcc434b[m Fix build
+[33mee8661d[m Fix build
+[33m6d9286a[m Confirm shipment button (tagged build)
+[33m94aee23[m Enable confirm shipment on inbound and outbound receipts
+[33m0a91d81[m Gate status change behind confirmation button
+[33m344c2ed[m Secure receipt confirmation with token in QR (Option A)
+[33m1f88109[m Fix miniCard style and complete confirm/employee UI
+[33md79f693[m Add confirm modal to docket actions and fix build typo
+[33m97708cb[m Fix public receipt confirm, token scope, and TS build errors
+[33m777716b[m Fix build + split settings into company vs employee
+[33m63af0ea[m Fix TS unused local + persist local fallback batches
+[33m1511766[m Supabase RLS + multi-company auth + DB-backed batches
