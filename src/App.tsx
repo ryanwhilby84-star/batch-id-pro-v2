@@ -11,7 +11,7 @@
 // - Hybrid persistence: Supabase when configured, else localStorage fallback.
 //   NOTE: External receipt confirmation only truly works with Supabase because a phone scanning QR does not share your localStorage.
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { createClient, type Session, type User } from "@supabase/supabase-js";
 
@@ -729,79 +729,80 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
           </div>
         )}
 
-        {batch.status === "In Transit" && (
-          <div className="section">
-            <div className="sec-label">Recipient Confirmation</div>
-            {(() => {
-              const action: "dispatch" | "receipt" | null =
-                batch?.batchType === "inbound" && batch?.status === "Created"
-                  ? "dispatch"
-                  : batch?.batchType === "outbound" && batch?.status === "In Transit"
-                  ? "receipt"
-                  : null;
+                <div className="section">
+          <div className="sec-label">Confirmation</div>
+          {(() => {
+            // External confirmation rules:
+            // - Inbound + Created  => Supplier confirms dispatch (moves to In Transit)
+            // - Outbound + In Transit => Buyer confirms receipt (moves to Completed)
+            const action: "dispatch" | "receipt" | null =
+              batch?.batchType === "inbound" && batch?.status === "Created"
+                ? "dispatch"
+                : batch?.batchType === "outbound" && batch?.status === "In Transit"
+                ? "receipt"
+                : null;
 
-              const label =
-                action === "dispatch"
-                  ? done
-                    ? "Dispatch Confirmed ✅"
-                    : "Confirm Dispatch"
-                  : action === "receipt"
-                  ? done
-                    ? "Receipt Confirmed ✅"
-                    : "Confirm Receipt"
-                  : "No action required";
+            const label =
+              action === "dispatch"
+                ? done
+                  ? "Dispatch Confirmed ✅"
+                  : "Confirm Dispatch"
+                : action === "receipt"
+                ? done
+                  ? "Receipt Confirmed ✅"
+                  : "Confirm Receipt"
+                : "No action required";
 
-              const hint =
-                action === "dispatch"
-                  ? "Supplier confirms this docket has been dispatched. This moves the batch into the system as In Transit."
-                  : action === "receipt"
-                  ? "Buyer confirms receipt. This marks the batch as Completed and locks it."
-                  : "This receipt is for viewing only.";
+            const hint =
+              action === "dispatch"
+                ? "Supplier confirms this docket has been dispatched. This moves the batch into the system as In Transit."
+                : action === "receipt"
+                ? "Buyer confirms receipt. This marks the batch as Completed and locks it."
+                : "This receipt is for viewing only.";
 
-              if (!action) {
-                return (
-                  <>
-                    <div style={{ fontWeight: 800, marginBottom: 8 }}>Receipt view</div>
-                    <div className="hint">{hint}</div>
-                  </>
-                );
-              }
-
-              if (!supabase) {
-                return (
-                  <>
-                    <div style={{ fontWeight: 800, marginBottom: 8 }}>Online confirmation is not enabled on this build.</div>
-                    <div className="hint">
-                      This receipt page is running on a different device. Without Supabase (or another database), it cannot update the system.
-                      Enable Supabase to make confirmations update instantly.
-                    </div>
-                  </>
-                );
-              }
-
-              if (!token) {
-                return (
-                  <>
-                    <div style={{ fontWeight: 800, marginBottom: 8 }}>Confirmation link missing token</div>
-                    <div className="hint">
-                      This receipt link needs a secure token to allow external confirmation.
-                      Re-generate the QR/receipt link from the app so it includes <b>?t=...</b>.
-                    </div>
-                  </>
-                );
-              }
-
+            if (!action) {
               return (
                 <>
-                  <button className={`btn ${done ? "btnOk" : "btnPrimary"}`} onClick={onConfirmReceipt} disabled={done}>
-                    {label}
-                  </button>
+                  <div style={{ fontWeight: 800, marginBottom: 8 }}>Receipt view</div>
                   <div className="hint">{hint}</div>
                 </>
               );
-            })()}
-          </div>
-        )}
+            }
+
+            if (!supabase) {
+              return (
+                <>
+                  <div style={{ fontWeight: 800, marginBottom: 8 }}>Online confirmation is not enabled on this build.</div>
+                  <div className="hint">
+                    This receipt page is running on a different device. Without Supabase (or another database), it cannot update the system.
+                    Enable Supabase to make confirmations update instantly.
+                  </div>
+                </>
+              );
+            }
+
+            if (!token) {
+              return (
+                <>
+                  <div style={{ fontWeight: 800, marginBottom: 8 }}>Confirmation link missing token</div>
+                  <div className="hint">
+                    This receipt link needs a secure token to allow external confirmation.
+                    Re-generate the QR/receipt link from the app so it includes <b>?t=...</b>.
+                  </div>
+                </>
+              );
+            }
+
+            return (
+              <>
+                <button className={`btn ${done ? "btnOk" : "btnPrimary"}`} onClick={onConfirmReceipt} disabled={done}>
+                  {label}
+                </button>
+                <div className="hint">{hint}</div>
+              </>
+            );
+          })()}
+        </div>
 
         <div className="section">
           <div className="sec-label">Batch Details</div>
@@ -2239,35 +2240,6 @@ function BatchDetail({ batch, updateBatch, deleteBatch, archiveBatch, unarchiveB
   const [healthCertNo, setHealthCertNo] = useState(batch.healthCertNo || "");
   const [transportLegs, setTransportLegs] = useState<TransportLeg[]>(batch.transportLegs || []);
 
-  // Confirm modal (avoids relying on window.confirm, which can be inconsistent in PWAs)
-  const [confirmOpen, setConfirmOpen] = useState(false);
-  const [confirmTitle, setConfirmTitle] = useState("");
-  const [confirmSubtitle, setConfirmSubtitle] = useState<string | undefined>(undefined);
-  const [confirmText, setConfirmText] = useState("Confirm");
-  const [confirmBody, setConfirmBody] = useState<ReactNode>(null);
-  const confirmActionRef = useRef<null | (() => Promise<void> | void)>(null);
-
-  const openConfirm = (opts: {
-    title: string;
-    subtitle?: string;
-    confirmText?: string;
-    body?: ReactNode;
-    onConfirm: () => Promise<void> | void;
-  }) => {
-    setConfirmTitle(opts.title);
-    setConfirmSubtitle(opts.subtitle);
-    setConfirmText(opts.confirmText || "Confirm");
-    setConfirmBody(opts.body ?? null);
-    confirmActionRef.current = opts.onConfirm;
-    setConfirmOpen(true);
-  };
-
-  const closeConfirm = () => {
-    setConfirmOpen(false);
-    setConfirmBody(null);
-    confirmActionRef.current = null;
-  };
-
   useEffect(() => {
     setLandingCertNo(batch.landingCertNo || "");
     setProcessingCertNo(batch.processingCertNo || "");
@@ -2306,69 +2278,27 @@ function BatchDetail({ batch, updateBatch, deleteBatch, archiveBatch, unarchiveB
       addToast("error", "Shipment cannot be confirmed for this batch.");
       return;
     }
+    // eslint-disable-next-line no-restricted-globals
+    const ok = confirm(
+      `CONFIRM SHIPMENT?\n\nThis will mark the batch as IN TRANSIT (SENT) and LOCK it.\nNo edits, no delete, no rollback.\n\nContinue?`
+    );
+    if (!ok) return;
 
-    openConfirm({
-      title: "Confirm shipment",
-      subtitle: "This will mark the batch as IN TRANSIT (SENT) and lock it.",
-      confirmText: "Confirm Shipment",
-      body: (
-        <div style={{ display: "grid", gap: 10 }}>
-          <div style={S.kvRow}>
-            <div style={S.kvKey}>Batch ID</div>
-            <div style={S.kvVal}>{batch.id}</div>
-          </div>
-          <div style={S.kvRow}>
-            <div style={S.kvKey}>From</div>
-            <div style={S.kvVal}>{batch.fromCompany}</div>
-          </div>
-          <div style={S.kvRow}>
-            <div style={S.kvKey}>To</div>
-            <div style={S.kvVal}>{batch.toCompany}</div>
-          </div>
-          <div style={S.kvRow}>
-            <div style={S.kvKey}>Total</div>
-            <div style={S.kvVal}>{totalKg(batch)} kg</div>
-          </div>
-          <div style={{ ...S.small, opacity: 0.75 }}>
-            After confirmation: no edits, no delete, no rollback.
-          </div>
-        </div>
-      ),
-      onConfirm: async () => {
-        updateBatch(batch.id, {
-          landingCertNo,
-          processingCertNo,
-          catchCertNo,
-          healthCertNo,
-          transportLegs,
-          status: "In Transit",
-          sentAt: nowISO(),
-          locked: true,
-        });
-        addToast("success", "Shipment confirmed (In Transit / Sent)");
-        closeConfirm();
-      },
+    updateBatch(batch.id, {
+      landingCertNo,
+      processingCertNo,
+      catchCertNo,
+      healthCertNo,
+      transportLegs,
+      status: "In Transit",
+      sentAt: nowISO(),
+      locked: true,
     });
+    addToast("success", "Shipment confirmed (In Transit / Sent)");
   };
 
   return (
     <div style={S.card}>
-      {confirmOpen && (
-        <ConfirmModal
-          title={confirmTitle}
-          subtitle={confirmSubtitle}
-          confirmText={confirmText}
-          onCancel={closeConfirm}
-          onConfirm={async () => {
-            const fn = confirmActionRef.current;
-            if (!fn) return;
-            await fn();
-          }}
-        >
-          {confirmBody}
-        </ConfirmModal>
-      )}
-
       <div style={S.cardPad}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap" as const, gap: 10, marginBottom: 16 }}>
           <div>
@@ -2833,6 +2763,32 @@ function SettingsView({ addToast, user, selectedCompany, companyRole }: any) {
               placeholder="e.g. Portavogie Fish Co."
             />
 
+            <div style={{ height: 12 }} />
+
+            <div style={{ ...S.miniCard, marginBottom: 10 }}>
+              <div style={{ ...S.small, opacity: 0.9, fontWeight: 800, marginBottom: 6 }}>Employee Invite Code</div>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                <code style={{ padding: "8px 10px", borderRadius: 10, background: "#0B1220", border: "1px solid rgba(255,255,255,0.10)", color: "#E8EDF5" }}>
+                  {String(selectedCompany?.id || "")}
+                </code>
+                <button
+                  type="button"
+                  style={{ ...S.btn, padding: "8px 12px" }}
+                  onClick={() => {
+                    const code = String(selectedCompany?.id || "");
+                    if (!code) return;
+                    navigator.clipboard?.writeText(code);
+                    addToast("Invite code copied");
+                  }}
+                >
+                  Copy
+                </button>
+              </div>
+              <div style={{ ...S.small, opacity: 0.65, marginTop: 8 }}>
+                Employees: go to <b>Sign up</b> → <b>Join Company</b> and paste this code.
+              </div>
+            </div>
+
             <div style={{ height: 10 }} />
             <button type="button" style={{ ...S.btn, ...S.btnPrimary, marginBottom: 0 }} onClick={saveCompany} disabled={saving}>
               {saving ? "Saving..." : "Save Company Settings"}
@@ -2890,6 +2846,7 @@ const S = {
   },
   cardPad: { padding: 20 },
   subCard: { background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 14 },
+  miniCard: { background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 12 },
   divider: { height: 1, background: "rgba(255,255,255,0.06)", margin: "16px 0" },
   h2: { fontSize: 16, fontWeight: 900, letterSpacing: 0.2 },
   small: { fontSize: 12, lineHeight: 1.4 },
