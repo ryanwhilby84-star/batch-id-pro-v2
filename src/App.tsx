@@ -428,6 +428,37 @@ async function sbFetchBatchById(id: string): Promise<{ ok: boolean; batch?: Batc
   }
 }
 
+
+async function sbFetchPublicReceipt(receiptId: string, token: string | null): Promise<{ ok: boolean; batch?: Batch; error?: string }> {
+  if (!supabase) return { ok: false, error: "Supabase not configured" };
+
+  // If you create the RPC below, this enables public (anon) receipt fetching without exposing your whole batches table.
+  if (token) {
+    try {
+      const { data, error } = await supabase.rpc("public_get_receipt", { p_receipt_id: receiptId, p_token: token });
+      if (!error && data) return { ok: true, batch: data as any };
+    } catch {
+      // ignore and fall back
+    }
+  }
+
+  // Fallback: normal select (works only for authenticated members via RLS)
+  return await sbFetchBatchById(receiptId);
+}
+
+async function sbExternalConfirm(receiptId: string, token: string | null, action: "dispatch" | "receipt"): Promise<{ ok: boolean; error?: string }> {
+  if (!supabase) return { ok: false, error: "Supabase not configured" };
+  if (!token) return { ok: false, error: "Missing confirmation token" };
+
+  try {
+    const { error } = await supabase.rpc("external_confirm", { p_receipt_id: receiptId, p_token: token, p_action: action });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || "Unknown error" };
+  }
+}
+
 async function sbConfirmReceipt(id: string): Promise<{ ok: boolean; batch?: Batch; error?: string }> {
   if (!supabase) return { ok: false, error: "Supabase not configured" };
 
@@ -476,6 +507,11 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
   const [err, setErr] = useState<string>("");
   const [done, setDone] = useState(false);
 
+  const token = useMemo(() => {
+    if (typeof window === "undefined") return null as string | null;
+    return new URLSearchParams(window.location.search).get("t");
+  }, []);
+
   const setFromEncoded = useCallback(() => {
     if (!encoded) return false;
     const decoded = safeDecode(encoded);
@@ -498,7 +534,7 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
 
       // 2) If Supabase configured, fetch live record so confirm receipt works
       if (supabase) {
-        const f = await sbFetchBatchById(receiptId);
+        const f = await sbFetchPublicReceipt(receiptId, token || "");
         if (mounted) {
           if (f.ok && f.batch) {
             setBatch(f.batch);
@@ -517,7 +553,7 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
     return () => {
       mounted = false;
     };
-  }, [receiptId, setFromEncoded]);
+  }, [receiptId, setFromEncoded, token]);
 
   const statusColor = (s: string) => (s === "Completed" ? "#22C55E" : s === "In Transit" ? "#F59E0B" : "#3B82F6");
   const typeBg = (t: string) => (t === "inbound" ? "rgba(59,130,246,0.15)" : "rgba(249,115,22,0.15)");
@@ -548,11 +584,12 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
     *{box-sizing:border-box;margin:0;padding:0}
     body{background:#080D14;color:#E8EDF5;font-family:system-ui,sans-serif;min-height:100vh}
     .wrap{max-width:700px;margin:0 auto;padding:28px 16px 60px}
-    .hdr{display:flex;align-items:center;gap:14px;margin-bottom:18px;padding-bottom:18px;border-bottom:1px solid rgba(255,255,255,0.07)}
+    .hdr{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px;padding-bottom:18px;border-bottom:1px solid rgba(255,255,255,0.07)}
     .hdr img{height:48px;border-radius:10px}
     .hdr h1{font-size:18px;font-weight:900}
     .bid{font-size:11px;font-family:monospace;opacity:0.5;margin-top:3px}
-    .badge{display:inline-flex;padding:4px 12px;border-radius:999px;font-size:11px;font-weight:800;margin-left:auto}
+    .badge{display:inline-flex;padding:4px 12px;border-radius:999px;font-size:11px;font-weight:800;margin-left:0}
+    @media (min-width:560px){.badge{margin-left:auto}}
     .section{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:18px;margin-bottom:12px}
     .sec-label{font-size:10px;font-weight:800;letter-spacing:1.2px;text-transform:uppercase;opacity:0.5;margin-bottom:12px}
     .kv{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:13px}
@@ -575,13 +612,38 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
   const onConfirmReceipt = async () => {
     if (!batch?.id) return;
 
+    const action: "dispatch" | "receipt" | null =
+      batch.batchType === "inbound" && batch.status === "Created"
+        ? "dispatch"
+        : batch.batchType === "outbound" && batch.status === "In Transit"
+        ? "receipt"
+        : null;
+
+    if (!action) {
+      setDone(true);
+      return;
+    }
+
     if (!supabase) {
-      setErr("This build has no online database configured, so the sender system cannot be updated from this device.");
+      setErr("This build has no online database configured, so confirmations cannot update the system.");
       setDone(true);
       return;
     }
 
     setErr("");
+
+    if (token) {
+      const res = await sbExternalConfirm(batch.id, token, action);
+      if (!res.ok) {
+        setErr(res.error || "Confirm failed");
+        return;
+      }
+      const refreshed = await sbFetchPublicReceipt(batch.id, token);
+      if (refreshed.ok && refreshed.batch) setBatch(refreshed.batch);
+      setDone(true);
+      return;
+    }
+
     const res = await sbConfirmReceipt(batch.id);
     if (!res.ok) {
       setErr(res.error || "Confirm failed");
@@ -670,24 +732,74 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
         {batch.status === "In Transit" && (
           <div className="section">
             <div className="sec-label">Recipient Confirmation</div>
-            {!supabase ? (
-              <>
-                <div style={{ fontWeight: 800, marginBottom: 8 }}>Online confirmation is not enabled on this build.</div>
-                <div className="hint">
-                  This receipt page is running on a different device. Without Supabase (or another database), it cannot update the sender’s system.
-                  Enable Supabase to make “Confirm Receipt” update the batch instantly.
-                </div>
-              </>
-            ) : (
-              <>
-                <button className={`btn ${done ? "btnOk" : "btnPrimary"}`} onClick={onConfirmReceipt} disabled={done}>
-                  {done ? "Receipt Confirmed ✅" : "Confirm Receipt"}
-                </button>
-                <div className="hint">
-                  Pressing this will mark the batch as <b>Completed</b> and lock it permanently.
-                </div>
-              </>
-            )}
+            {(() => {
+              const action: "dispatch" | "receipt" | null =
+                batch?.batchType === "inbound" && batch?.status === "Created"
+                  ? "dispatch"
+                  : batch?.batchType === "outbound" && batch?.status === "In Transit"
+                  ? "receipt"
+                  : null;
+
+              const label =
+                action === "dispatch"
+                  ? done
+                    ? "Dispatch Confirmed ✅"
+                    : "Confirm Dispatch"
+                  : action === "receipt"
+                  ? done
+                    ? "Receipt Confirmed ✅"
+                    : "Confirm Receipt"
+                  : "No action required";
+
+              const hint =
+                action === "dispatch"
+                  ? "Supplier confirms this docket has been dispatched. This moves the batch into the system as In Transit."
+                  : action === "receipt"
+                  ? "Buyer confirms receipt. This marks the batch as Completed and locks it."
+                  : "This receipt is for viewing only.";
+
+              if (!action) {
+                return (
+                  <>
+                    <div style={{ fontWeight: 800, marginBottom: 8 }}>Receipt view</div>
+                    <div className="hint">{hint}</div>
+                  </>
+                );
+              }
+
+              if (!supabase) {
+                return (
+                  <>
+                    <div style={{ fontWeight: 800, marginBottom: 8 }}>Online confirmation is not enabled on this build.</div>
+                    <div className="hint">
+                      This receipt page is running on a different device. Without Supabase (or another database), it cannot update the system.
+                      Enable Supabase to make confirmations update instantly.
+                    </div>
+                  </>
+                );
+              }
+
+              if (!token) {
+                return (
+                  <>
+                    <div style={{ fontWeight: 800, marginBottom: 8 }}>Confirmation link missing token</div>
+                    <div className="hint">
+                      This receipt link needs a secure token to allow external confirmation.
+                      Re-generate the QR/receipt link from the app so it includes <b>?t=...</b>.
+                    </div>
+                  </>
+                );
+              }
+
+              return (
+                <>
+                  <button className={`btn ${done ? "btnOk" : "btnPrimary"}`} onClick={onConfirmReceipt} disabled={done}>
+                    {label}
+                  </button>
+                  <div className="hint">{hint}</div>
+                </>
+              );
+            })()}
           </div>
         )}
 
@@ -1674,7 +1786,7 @@ function BatchesView({ batches, tab, setTab, openBatch, deleteBatch }: any) {
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
         <h2 style={{ fontSize: 20, fontWeight: 900 }}>Batches</h2>
-        <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" as const, justifyContent: "flex-end", alignItems: "center" }}>
           {(["Created", "In Transit"] as BatchStatus[]).map((t) => (
             <button key={t} style={{ ...S.tabBtn, ...(tab === t ? S.tabBtnActive : {}) }} onClick={() => setTab(t)}>
               {t}
@@ -2758,8 +2870,7 @@ const S = {
     borderRadius: 8,
     padding: "7px 12px",
     fontSize: 12,
-    fontWeight: 700,
-  },
+    fontWeight: 700, whiteSpace: "nowrap" as const },
   navBtnActive: { borderColor: "rgba(249,115,22,0.5)", background: "rgba(249,115,22,0.12)", color: "#F97316" },
   tabBtn: {
     cursor: "pointer",
