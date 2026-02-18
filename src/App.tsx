@@ -1,5 +1,5 @@
 // Batch ID Pro — Single-File App (V1.1 — CONFIRM + LOCK + QR RECEIPT CONFIRM + LOGOUT + (OPTIONAL) SUPABASE)
-// QR codes point to resolver at https://batch.coresystemsni.com/?receipt=ID&d=ENCODED&t=TOKEN
+// QR codes point to resolver at https://batch.coresystemsni.com/?receipt=ID&d=ENCODED
 // No router. Vite + React. TypeScript-safe.
 //
 // Key rules implemented:
@@ -12,8 +12,6 @@
 //   NOTE: External receipt confirmation only truly works with Supabase because a phone scanning QR does not share your localStorage.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-
-const BUILD_TAG = 'CONFIRM-INBOUND-OUTBOUND-WORKING-v1';
 import { QRCodeSVG } from "qrcode.react";
 import { createClient, type Session, type User } from "@supabase/supabase-js";
 
@@ -151,9 +149,6 @@ interface Batch {
 
   archived?: boolean;
 
-  // Secure token embedded in QR for external confirmations
-  receiptToken?: string;
-
   landingCertNo?: string;
   processingCertNo?: string;
   catchCertNo?: string;
@@ -270,13 +265,6 @@ async function loadBatches(companyId: string): Promise<Batch[]> {
 
 // ─── UTILS ───────────────────────────────────────────────────────────────────
 const uid = () => Math.random().toString(16).slice(2, 10).toUpperCase();
-const genToken = () => {
-  try {
-    const c: any = (globalThis as any).crypto;
-    if (c && typeof c.randomUUID === "function") return String(c.randomUUID());
-  } catch {}
-  return `${uid()}-${uid()}-${uid()}`.toLowerCase();
-};
 const nowISO = () => new Date().toISOString();
 const fmtDate = (s: string) => {
   try {
@@ -361,7 +349,6 @@ async function sbUpsertBatch(companyId: string, batch: Batch): Promise<{ ok: boo
     const payload: any = {
       id: batch.id,
       company_id: companyId,
-      receipt_token: batch.receiptToken || null,
       batch_type: batch.batchType,
       status: batch.status,
       created_at: batch.createdAt,
@@ -421,7 +408,6 @@ async function sbFetchBatchById(id: string): Promise<{ ok: boolean; batch?: Batc
       orderDate: data.order_date || "",
       lotRef: data.lot_ref || "",
       notes: data.notes || "",
-      receiptToken: data.receipt_token || undefined,
       speciesLines: (data.species_lines || []) as SpeciesLine[],
       transportLegs: (data.transport_legs || []) as TransportLeg[],
       archived: !!data.archived,
@@ -437,37 +423,6 @@ async function sbFetchBatchById(id: string): Promise<{ ok: boolean; batch?: Batc
     };
 
     return { ok: true, batch: b };
-  } catch (e: any) {
-    return { ok: false, error: e?.message || "Unknown error" };
-  }
-}
-
-
-async function sbFetchPublicReceipt(receiptId: string, token: string | null): Promise<{ ok: boolean; batch?: Batch; error?: string }> {
-  if (!supabase) return { ok: false, error: "Supabase not configured" };
-
-  // If you create the RPC below, this enables public (anon) receipt fetching without exposing your whole batches table.
-  if (token) {
-    try {
-      const { data, error } = await supabase.rpc("public_get_receipt", { p_receipt_id: receiptId, p_token: token });
-      if (!error && data) return { ok: true, batch: data as any };
-    } catch {
-      // ignore and fall back
-    }
-  }
-
-  // Fallback: normal select (works only for authenticated members via RLS)
-  return await sbFetchBatchById(receiptId);
-}
-
-async function sbExternalConfirm(receiptId: string, token: string | null, action: "dispatch" | "receipt"): Promise<{ ok: boolean; error?: string }> {
-  if (!supabase) return { ok: false, error: "Supabase not configured" };
-  if (!token) return { ok: false, error: "Missing confirmation token" };
-
-  try {
-    const { error } = await supabase.rpc("external_confirm", { p_receipt_id: receiptId, p_token: token, p_action: action });
-    if (error) return { ok: false, error: error.message };
-    return { ok: true };
   } catch (e: any) {
     return { ok: false, error: e?.message || "Unknown error" };
   }
@@ -518,15 +473,8 @@ function canConfirmShipment(b: Batch): boolean {
 function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: string | null }) {
   const [loading, setLoading] = useState(true);
   const [batch, setBatch] = useState<any | null>(null);
-
-  const [isConfirmed, setIsConfirmed] = useState(false);
   const [err, setErr] = useState<string>("");
   const [done, setDone] = useState(false);
-
-  const token = useMemo(() => {
-    if (typeof window === "undefined") return null as string | null;
-    return new URLSearchParams(window.location.search).get("t");
-  }, []);
 
   const setFromEncoded = useCallback(() => {
     if (!encoded) return false;
@@ -550,7 +498,7 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
 
       // 2) If Supabase configured, fetch live record so confirm receipt works
       if (supabase) {
-        const f = await sbFetchPublicReceipt(receiptId, token || "");
+        const f = await sbFetchBatchById(receiptId);
         if (mounted) {
           if (f.ok && f.batch) {
             setBatch(f.batch);
@@ -569,7 +517,7 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
     return () => {
       mounted = false;
     };
-  }, [receiptId, setFromEncoded, token]);
+  }, [receiptId, setFromEncoded]);
 
   const statusColor = (s: string) => (s === "Completed" ? "#22C55E" : s === "In Transit" ? "#F59E0B" : "#3B82F6");
   const typeBg = (t: string) => (t === "inbound" ? "rgba(59,130,246,0.15)" : "rgba(249,115,22,0.15)");
@@ -600,12 +548,11 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
     *{box-sizing:border-box;margin:0;padding:0}
     body{background:#080D14;color:#E8EDF5;font-family:system-ui,sans-serif;min-height:100vh}
     .wrap{max-width:700px;margin:0 auto;padding:28px 16px 60px}
-    .hdr{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px;padding-bottom:18px;border-bottom:1px solid rgba(255,255,255,0.07)}
+    .hdr{display:flex;align-items:center;gap:14px;margin-bottom:18px;padding-bottom:18px;border-bottom:1px solid rgba(255,255,255,0.07)}
     .hdr img{height:48px;border-radius:10px}
     .hdr h1{font-size:18px;font-weight:900}
     .bid{font-size:11px;font-family:monospace;opacity:0.5;margin-top:3px}
-    .badge{display:inline-flex;padding:4px 12px;border-radius:999px;font-size:11px;font-weight:800;margin-left:0}
-    @media (min-width:560px){.badge{margin-left:auto}}
+    .badge{display:inline-flex;padding:4px 12px;border-radius:999px;font-size:11px;font-weight:800;margin-left:auto}
     .section{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:18px;margin-bottom:12px}
     .sec-label{font-size:10px;font-weight:800;letter-spacing:1.2px;text-transform:uppercase;opacity:0.5;margin-bottom:12px}
     .kv{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:13px}
@@ -628,40 +575,13 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
   const onConfirmReceipt = async () => {
     if (!batch?.id) return;
 
-    const action: "dispatch" | "receipt" | null =
-      batch.batchType === "inbound" && batch.status === "Created"
-        ? "dispatch"
-        : batch.batchType === "outbound" && batch.status === "Created"
-        ? "dispatch"
-        : batch.batchType === "outbound" && batch.status === "In Transit"
-        ? "receipt"
-        : null;
-
-    if (!action) {
-      setDone(true);
-      return;
-    }
-
     if (!supabase) {
-      setErr("This build has no online database configured, so confirmations cannot update the system.");
+      setErr("This build has no online database configured, so the sender system cannot be updated from this device.");
       setDone(true);
       return;
     }
 
     setErr("");
-
-    if (token) {
-      const res = await sbExternalConfirm(batch.id, token, action);
-      if (!res.ok) {
-        setErr(res.error || "Confirm failed");
-        return;
-      }
-      const refreshed = await sbFetchPublicReceipt(batch.id, token);
-      if (refreshed.ok && refreshed.batch) setBatch(refreshed.batch);
-      setDone(true);
-      return;
-    }
-
     const res = await sbConfirmReceipt(batch.id);
     if (!res.ok) {
       setErr(res.error || "Confirm failed");
@@ -691,7 +611,7 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
             <div style={{ fontWeight: 900, marginBottom: 6 }}>Receipt not available</div>
             <div>{err}</div>
           </div>
-          <div className="footer">Powered by Core Systems NI · Batch ID Pro · {BUILD_TAG}</div>
+          <div className="footer">Powered by Core Systems NI · Batch ID Pro</div>
         </div>
       </div>
     );
@@ -747,82 +667,29 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
           </div>
         )}
 
-                <div className="section">
-          <div className="sec-label">Confirmation</div>
-          {(() => {
-            // External confirmation rules:
-            // - Inbound + Created  => Supplier confirms dispatch (moves to In Transit)
-            // - Outbound + In Transit => Buyer confirms receipt (moves to Completed)
-            const action: "dispatch" | "receipt" | null =
-      batch.batchType === "inbound" && batch.status === "Created"
-        ? "dispatch"
-        : batch.batchType === "outbound" && batch.status === "Created"
-        ? "dispatch"
-        : batch.batchType === "outbound" && batch.status === "In Transit"
-        ? "receipt"
-        : null;
-
-            const label =
-              action === "dispatch"
-                ? done
-                  ? "Dispatch Confirmed ✅"
-                  : "Confirm Dispatch"
-                : action === "receipt"
-                ? done
-                  ? "Receipt Confirmed ✅"
-                  : "Confirm Receipt"
-                : "No action required";
-
-            const hint =
-              action === "dispatch"
-                ? "Supplier confirms this docket has been dispatched. This moves the batch into the system as In Transit."
-                : action === "receipt"
-                ? "Buyer confirms receipt. This marks the batch as Completed and locks it."
-                : "This receipt is for viewing only.";
-
-            if (!action) {
-              return (
-                <>
-                  <div style={{ fontWeight: 800, marginBottom: 8 }}>Receipt view</div>
-                  <div className="hint">{hint}</div>
-                </>
-              );
-            }
-
-            if (!supabase) {
-              return (
-                <>
-                  <div style={{ fontWeight: 800, marginBottom: 8 }}>Online confirmation is not enabled on this build.</div>
-                  <div className="hint">
-                    This receipt page is running on a different device. Without Supabase (or another database), it cannot update the system.
-                    Enable Supabase to make confirmations update instantly.
-                  </div>
-                </>
-              );
-            }
-
-            if (!token && action === "receipt") {
-              return (
-                <>
-                  <div style={{ fontWeight: 800, marginBottom: 8 }}>Confirmation link missing token</div>
-                  <div className="hint">
-                    This receipt link needs a secure token to allow external confirmation.
-                    Re-generate the QR/receipt link from the app so it includes <b>?t=...</b>.
-                  </div>
-                </>
-              );
-            }
-
-            return (
+        {batch.status === "In Transit" && (
+          <div className="section">
+            <div className="sec-label">Recipient Confirmation</div>
+            {!supabase ? (
+              <>
+                <div style={{ fontWeight: 800, marginBottom: 8 }}>Online confirmation is not enabled on this build.</div>
+                <div className="hint">
+                  This receipt page is running on a different device. Without Supabase (or another database), it cannot update the sender’s system.
+                  Enable Supabase to make “Confirm Receipt” update the batch instantly.
+                </div>
+              </>
+            ) : (
               <>
                 <button className={`btn ${done ? "btnOk" : "btnPrimary"}`} onClick={onConfirmReceipt} disabled={done}>
-                  {label}
+                  {done ? "Receipt Confirmed ✅" : "Confirm Receipt"}
                 </button>
-                <div className="hint">{hint}</div>
+                <div className="hint">
+                  Pressing this will mark the batch as <b>Completed</b> and lock it permanently.
+                </div>
               </>
-            );
-          })()}
-        </div>
+            )}
+          </div>
+        )}
 
         <div className="section">
           <div className="sec-label">Batch Details</div>
@@ -915,7 +782,7 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
           </div>
         )}
 
-        <div className="footer">Powered by Core Systems NI · Batch ID Pro · {BUILD_TAG}</div>
+        <div className="footer">Powered by Core Systems NI · Batch ID Pro</div>
       </div>
     </div>
   );
@@ -1249,17 +1116,7 @@ function CompanySelector({
 
 
 
-export default function App() {
-  // ── Receipt route detection ──
-  // QR codes encode: https://batch.coresystemsni.com/?receipt=ID&d=ENCODED&t=TOKEN
-  // If ?receipt= is present, render receipt page (external docket).
-  if (typeof window !== "undefined") {
-    const params = new URLSearchParams(window.location.search);
-    const receiptId = params.get("receipt");
-    const encoded = params.get("d");
-    if (receiptId) return <PublicReceipt receiptId={receiptId} encoded={encoded} />;
-  }
-
+function AppInner() {
   const [session, setSession] = useState<Session | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState<boolean>(!!supabase);
@@ -1322,43 +1179,7 @@ export default function App() {
       if (companyList.length === 1) setSelectedCompanyId(companyList[0].id);
     })();
   }, [user]);
-
-  if (authLoading) {
-    return (
-      <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#080D14", color: "white" }}>
-        Loading...
-      </div>
-    );
-  }
-
-  if (supabase && !user) {
-    return <AuthScreen onAuth={() => window.location.reload()} />;
-  }
-
-  if (supabase && companies.length > 1 && !selectedCompanyId) {
-    return <CompanySelector companies={companies} onSelect={setSelectedCompanyId} />;
-  }
-
-  if (supabase && !selectedCompanyId) {
-    return (
-      <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#080D14", color: "white" }}>
-        <div>No companies found. Contact your administrator.</div>
-      </div>
-    );
-  }
-
-  // Local fallback "session" (only when Supabase is not configured)
-  const [localSession, setLocalSession] = useState(() => lsGet(LOCAL_SESSION_KEY) || "ok");
-  useEffect(() => {
-    if (!supabase) lsSet(LOCAL_SESSION_KEY, localSession || "ok");
-  }, [localSession]);
-
-  const activeCompanyId = supabase ? (selectedCompanyId as string) : "local";
-
-  const [view, setView] = useState<View>("dashboard");
-  const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
-
-  const [batches, setBatches] = useState<Batch[]>(() => (supabase ? [] : loadBatchesLocal()));
+    const [batches, setBatches] = useState<Batch[]>(() => (supabase ? [] : loadBatchesLocal()));
 
   // Persist local batches when running without Supabase
   useEffect(() => {
@@ -1585,6 +1406,48 @@ const [speciesLibrary, setSpeciesLibrary] = useState<string[]>(() => lsJson(SPEC
     addToast("info", "Logged out");
   }, [addToast]);
 
+  // Local fallback "session" (only when Supabase is not configured)
+  const [localSession, setLocalSession] = useState(() => lsGet(LOCAL_SESSION_KEY) || "ok");
+  useEffect(() => {
+    if (!supabase) lsSet(LOCAL_SESSION_KEY, localSession || "ok");
+  }, [localSession]);
+
+  const activeCompanyId = supabase ? (selectedCompanyId as string) : "local";
+
+  const [view, setView] = useState<View>("dashboard");
+  const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
+
+  if (authLoading) {
+    return (
+      <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#080D14", color: "white" }}>
+        Loading...
+      </div>
+    );
+  }
+
+  if (supabase && !user) {
+    return <AuthScreen onAuth={() => window.location.reload()} />;
+
+  }
+
+
+
+
+
+  // ── Auth / Company gating (must be after all hooks to avoid React #310 hook-order crash) ──
+
+  if (supabase && companies.length > 1 && !selectedCompanyId) {
+    return <CompanySelector companies={companies} onSelect={setSelectedCompanyId} />;
+  }
+
+  if (supabase && !selectedCompanyId) {
+    return (
+      <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#080D14", color: "white" }}>
+        <div>No companies found. Contact your administrator.</div>
+      </div>
+    );
+  }
+
   return (
     <div style={S.app}>
       <ToastBar toasts={toasts} />
@@ -1807,7 +1670,7 @@ function BatchesView({ batches, tab, setTab, openBatch, deleteBatch }: any) {
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
         <h2 style={{ fontSize: 20, fontWeight: 900 }}>Batches</h2>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" as const, justifyContent: "flex-end", alignItems: "center" }}>
+        <div style={{ display: "flex", gap: 8 }}>
           {(["Created", "In Transit"] as BatchStatus[]).map((t) => (
             <button key={t} style={{ ...S.tabBtn, ...(tab === t ? S.tabBtnActive : {}) }} onClick={() => setTab(t)}>
               {t}
@@ -1971,7 +1834,6 @@ const handleVehiclePhotoChange = async (file: File | null) => {
 
     const batch: Batch = {
       id: uid(),
-      receiptToken: genToken(),
       batchType,
       status: "Created",
       createdAt: nowISO(),
@@ -2292,7 +2154,7 @@ function BatchDetail({ batch, updateBatch, deleteBatch, archiveBatch, unarchiveB
   };
 
   const encoded = encodeBatch({ ...batch, landingCertNo, processingCertNo, catchCertNo, healthCertNo, transportLegs });
-  const publicUrl = `${RESOLVER_BASE}/?receipt=${batch.id}&d=${encoded}&t=${encodeURIComponent(batch.receiptToken || '')}`;
+  const publicUrl = `${RESOLVER_BASE}/?receipt=${batch.id}&d=${encoded}`;
 
   const confirmShipment = async () => {
     if (!canConfirmShipment(batch)) {
@@ -2784,32 +2646,6 @@ function SettingsView({ addToast, user, selectedCompany, companyRole }: any) {
               placeholder="e.g. Portavogie Fish Co."
             />
 
-            <div style={{ height: 12 }} />
-
-            <div style={{ ...S.miniCard, marginBottom: 10 }}>
-              <div style={{ ...S.small, opacity: 0.9, fontWeight: 800, marginBottom: 6 }}>Employee Invite Code</div>
-              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-                <code style={{ padding: "8px 10px", borderRadius: 10, background: "#0B1220", border: "1px solid rgba(255,255,255,0.10)", color: "#E8EDF5" }}>
-                  {String(selectedCompany?.id || "")}
-                </code>
-                <button
-                  type="button"
-                  style={{ ...S.btn, padding: "8px 12px" }}
-                  onClick={() => {
-                    const code = String(selectedCompany?.id || "");
-                    if (!code) return;
-                    navigator.clipboard?.writeText(code);
-                    addToast("Invite code copied");
-                  }}
-                >
-                  Copy
-                </button>
-              </div>
-              <div style={{ ...S.small, opacity: 0.65, marginTop: 8 }}>
-                Employees: go to <b>Sign up</b> → <b>Join Company</b> and paste this code.
-              </div>
-            </div>
-
             <div style={{ height: 10 }} />
             <button type="button" style={{ ...S.btn, ...S.btnPrimary, marginBottom: 0 }} onClick={saveCompany} disabled={saving}>
               {saving ? "Saving..." : "Save Company Settings"}
@@ -2867,7 +2703,6 @@ const S = {
   },
   cardPad: { padding: 20 },
   subCard: { background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 14 },
-  miniCard: { background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 12 },
   divider: { height: 1, background: "rgba(255,255,255,0.06)", margin: "16px 0" },
   h2: { fontSize: 16, fontWeight: 900, letterSpacing: 0.2 },
   small: { fontSize: 12, lineHeight: 1.4 },
@@ -2919,7 +2754,8 @@ const S = {
     borderRadius: 8,
     padding: "7px 12px",
     fontSize: 12,
-    fontWeight: 700, whiteSpace: "nowrap" as const },
+    fontWeight: 700,
+  },
   navBtnActive: { borderColor: "rgba(249,115,22,0.5)", background: "rgba(249,115,22,0.12)", color: "#F97316" },
   tabBtn: {
     cursor: "pointer",
@@ -2999,3 +2835,19 @@ const S = {
     };
   },
 };
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Root export: decide between PublicReceipt (QR) and the main app safely (no hooks).
+// ────────────────────────────────────────────────────────────────────────────────
+type ReceiptInfo = { receiptId: string | null; encoded: string | null };
+function getReceiptInfo(): ReceiptInfo {
+  if (typeof window === "undefined") return { receiptId: null, encoded: null };
+  const params = new URLSearchParams(window.location.search);
+  return { receiptId: params.get("receipt"), encoded: params.get("d") };
+}
+
+export default function App() {
+  const { receiptId, encoded } = getReceiptInfo();
+  if (receiptId) return <PublicReceipt receiptId={receiptId} encoded={encoded} />;
+  return <AppInner />;
+}
