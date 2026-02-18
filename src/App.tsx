@@ -11,7 +11,7 @@
 // - Hybrid persistence: Supabase when configured, else localStorage fallback.
 //   NOTE: External receipt confirmation only truly works with Supabase because a phone scanning QR does not share your localStorage.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { createClient, type Session, type User } from "@supabase/supabase-js";
 
@@ -2239,6 +2239,35 @@ function BatchDetail({ batch, updateBatch, deleteBatch, archiveBatch, unarchiveB
   const [healthCertNo, setHealthCertNo] = useState(batch.healthCertNo || "");
   const [transportLegs, setTransportLegs] = useState<TransportLeg[]>(batch.transportLegs || []);
 
+  // Confirm modal (avoids relying on window.confirm, which can be inconsistent in PWAs)
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [confirmTitle, setConfirmTitle] = useState("");
+  const [confirmSubtitle, setConfirmSubtitle] = useState<string | undefined>(undefined);
+  const [confirmText, setConfirmText] = useState("Confirm");
+  const [confirmBody, setConfirmBody] = useState<ReactNode>(null);
+  const confirmActionRef = useRef<null | (() => Promise<void> | void)>(null);
+
+  const openConfirm = (opts: {
+    title: string;
+    subtitle?: string;
+    confirmText?: string;
+    body?: ReactNode;
+    onConfirm: () => Promise<void> | void;
+  }) => {
+    setConfirmTitle(opts.title);
+    setConfirmSubtitle(opts.subtitle);
+    setConfirmText(opts.confirmText || "Confirm");
+    setConfirmBody(opts.body ?? null);
+    confirmActionRef.current = opts.onConfirm;
+    setConfirmOpen(true);
+  };
+
+  const closeConfirm = () => {
+    setConfirmOpen(false);
+    setConfirmBody(null);
+    confirmActionRef.current = null;
+  };
+
   useEffect(() => {
     setLandingCertNo(batch.landingCertNo || "");
     setProcessingCertNo(batch.processingCertNo || "");
@@ -2277,27 +2306,69 @@ function BatchDetail({ batch, updateBatch, deleteBatch, archiveBatch, unarchiveB
       addToast("error", "Shipment cannot be confirmed for this batch.");
       return;
     }
-    // eslint-disable-next-line no-restricted-globals
-    const ok = confirm(
-      `CONFIRM SHIPMENT?\n\nThis will mark the batch as IN TRANSIT (SENT) and LOCK it.\nNo edits, no delete, no rollback.\n\nContinue?`
-    );
-    if (!ok) return;
 
-    updateBatch(batch.id, {
-      landingCertNo,
-      processingCertNo,
-      catchCertNo,
-      healthCertNo,
-      transportLegs,
-      status: "In Transit",
-      sentAt: nowISO(),
-      locked: true,
+    openConfirm({
+      title: "Confirm shipment",
+      subtitle: "This will mark the batch as IN TRANSIT (SENT) and lock it.",
+      confirmText: "Confirm Shipment",
+      body: (
+        <div style={{ display: "grid", gap: 10 }}>
+          <div style={S.kvRow}>
+            <div style={S.kvKey}>Batch ID</div>
+            <div style={S.kvVal}>{batch.id}</div>
+          </div>
+          <div style={S.kvRow}>
+            <div style={S.kvKey}>From</div>
+            <div style={S.kvVal}>{batch.fromCompany}</div>
+          </div>
+          <div style={S.kvRow}>
+            <div style={S.kvKey}>To</div>
+            <div style={S.kvVal}>{batch.toCompany}</div>
+          </div>
+          <div style={S.kvRow}>
+            <div style={S.kvKey}>Total</div>
+            <div style={S.kvVal}>{totalKg(batch)} kg</div>
+          </div>
+          <div style={{ ...S.small, opacity: 0.75 }}>
+            After confirmation: no edits, no delete, no rollback.
+          </div>
+        </div>
+      ),
+      onConfirm: async () => {
+        updateBatch(batch.id, {
+          landingCertNo,
+          processingCertNo,
+          catchCertNo,
+          healthCertNo,
+          transportLegs,
+          status: "In Transit",
+          sentAt: nowISO(),
+          locked: true,
+        });
+        addToast("success", "Shipment confirmed (In Transit / Sent)");
+        closeConfirm();
+      },
     });
-    addToast("success", "Shipment confirmed (In Transit / Sent)");
   };
 
   return (
     <div style={S.card}>
+      {confirmOpen && (
+        <ConfirmModal
+          title={confirmTitle}
+          subtitle={confirmSubtitle}
+          confirmText={confirmText}
+          onCancel={closeConfirm}
+          onConfirm={async () => {
+            const fn = confirmActionRef.current;
+            if (!fn) return;
+            await fn();
+          }}
+        >
+          {confirmBody}
+        </ConfirmModal>
+      )}
+
       <div style={S.cardPad}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap" as const, gap: 10, marginBottom: 16 }}>
           <div>
