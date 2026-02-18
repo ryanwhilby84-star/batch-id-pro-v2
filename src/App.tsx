@@ -1,5 +1,5 @@
 // Batch ID Pro — Single-File App (V1.1 — CONFIRM + LOCK + QR RECEIPT CONFIRM + LOGOUT + (OPTIONAL) SUPABASE)
-// QR codes point to resolver at https://batch.coresystemsni.com/?receipt=ID&d=ENCODED
+// QR codes point to resolver at https://batch.coresystemsni.com/?receipt=ID&d=ENCODED&t=TOKEN
 // No router. Vite + React. TypeScript-safe.
 //
 // Key rules implemented:
@@ -16,7 +16,7 @@ import { QRCodeSVG } from "qrcode.react";
 import { createClient, type Session, type User } from "@supabase/supabase-js";
 
 /* ---------- localStorage helpers (BUILD-SAFE) ---------- */
-function lsGet(key: string): string {
+function lsGet(key: string): string {a
   try {
     return window.localStorage.getItem(key) ?? "";
   } catch {
@@ -149,6 +149,9 @@ interface Batch {
 
   archived?: boolean;
 
+  // Secure token embedded in QR for external confirmations
+  receiptToken?: string;
+
   landingCertNo?: string;
   processingCertNo?: string;
   catchCertNo?: string;
@@ -265,6 +268,13 @@ async function loadBatches(companyId: string): Promise<Batch[]> {
 
 // ─── UTILS ───────────────────────────────────────────────────────────────────
 const uid = () => Math.random().toString(16).slice(2, 10).toUpperCase();
+const genToken = () => {
+  try {
+    const c: any = (globalThis as any).crypto;
+    if (c && typeof c.randomUUID === "function") return String(c.randomUUID());
+  } catch {}
+  return `${uid()}-${uid()}-${uid()}`.toLowerCase();
+};
 const nowISO = () => new Date().toISOString();
 const fmtDate = (s: string) => {
   try {
@@ -349,6 +359,7 @@ async function sbUpsertBatch(companyId: string, batch: Batch): Promise<{ ok: boo
     const payload: any = {
       id: batch.id,
       company_id: companyId,
+      receipt_token: batch.receiptToken || null,
       batch_type: batch.batchType,
       status: batch.status,
       created_at: batch.createdAt,
@@ -408,6 +419,7 @@ async function sbFetchBatchById(id: string): Promise<{ ok: boolean; batch?: Batc
       orderDate: data.order_date || "",
       lotRef: data.lot_ref || "",
       notes: data.notes || "",
+      receiptToken: data.receipt_token || undefined,
       speciesLines: (data.species_lines || []) as SpeciesLine[],
       transportLegs: (data.transport_legs || []) as TransportLeg[],
       archived: !!data.archived,
@@ -613,7 +625,9 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
     if (!batch?.id) return;
 
     const action: "dispatch" | "receipt" | null =
-      batch.batchType === "inbound" && batch.status === "Created"
+      !token
+        ? null
+        : batch.batchType === "inbound" && batch.status === "Created"
         ? "dispatch"
         : batch.batchType === "outbound" && batch.status === "In Transit"
         ? "receipt"
@@ -736,6 +750,9 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
             // - Inbound + Created  => Supplier confirms dispatch (moves to In Transit)
             // - Outbound + In Transit => Buyer confirms receipt (moves to Completed)
             const action: "dispatch" | "receipt" | null =
+              !token
+                ? null
+                :
               batch?.batchType === "inbound" && batch?.status === "Created"
                 ? "dispatch"
                 : batch?.batchType === "outbound" && batch?.status === "In Transit"
@@ -1231,7 +1248,7 @@ function CompanySelector({
 
 export default function App() {
   // ── Receipt route detection ──
-  // QR codes encode: https://batch.coresystemsni.com/?receipt=ID&d=ENCODED
+  // QR codes encode: https://batch.coresystemsni.com/?receipt=ID&d=ENCODED&t=TOKEN
   // If ?receipt= is present, render receipt page (external docket).
   if (typeof window !== "undefined") {
     const params = new URLSearchParams(window.location.search);
@@ -1951,6 +1968,7 @@ const handleVehiclePhotoChange = async (file: File | null) => {
 
     const batch: Batch = {
       id: uid(),
+      receiptToken: genToken(),
       batchType,
       status: "Created",
       createdAt: nowISO(),
@@ -2271,7 +2289,7 @@ function BatchDetail({ batch, updateBatch, deleteBatch, archiveBatch, unarchiveB
   };
 
   const encoded = encodeBatch({ ...batch, landingCertNo, processingCertNo, catchCertNo, healthCertNo, transportLegs });
-  const publicUrl = `${RESOLVER_BASE}/?receipt=${batch.id}&d=${encoded}`;
+  const publicUrl = `${RESOLVER_BASE}/?receipt=${batch.id}&d=${encoded}&t=${encodeURIComponent(batch.receiptToken || '')}`;
 
   const confirmShipment = async () => {
     if (!canConfirmShipment(batch)) {
