@@ -126,7 +126,7 @@ type View =
 
 type Toast = { id: string; type: "success" | "error" | "info"; message: string };
 type SpeciesLine = { species: string; weightKg: number };
-type TransportLeg = { transportCompany: string; vehicleReg: string; handoverTime: string; notes?: string };
+type TransportLeg = { transportCompany: string; vehicleReg: string; handoverTime: string; notes?: string; vehicleRegPhoto?: string };
 
 interface Batch {
   id: string;
@@ -142,6 +142,7 @@ interface Batch {
   orderDate: string;
   lotRef: string;
   notes: string;
+  icesAreaCode?: string;
 
   speciesLines: SpeciesLine[];
   transportLegs: TransportLeg[];
@@ -367,9 +368,17 @@ async function sbUpsertBatch(companyId: string, batch: Batch): Promise<{ ok: boo
       health_cert_no: batch.healthCertNo || null,
       landing_port: batch.landingPort || null,
       processing_plant: batch.processingPlant || null,
+      ices_area_code: batch.icesAreaCode || null,
     };
 
-    const { error } = await supabase.from("batches").upsert(payload, { onConflict: "id" });
+    let { error } = await supabase.from("batches").upsert(payload, { onConflict: "id" });
+
+    // Back-compat: if you haven't added the new column yet, retry without it.
+    if (error && /ices_area_code/i.test(error.message) && /does not exist/i.test(error.message)) {
+      delete payload.ices_area_code;
+      ({ error } = await supabase.from("batches").upsert(payload, { onConflict: "id" }));
+    }
+
     if (error) return { ok: false, error: error.message };
     return { ok: true };
   } catch (e: any) {
@@ -1123,6 +1132,8 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState<boolean>(!!supabase);
   const [companies, setCompanies] = useState<any[]>([]);
   const [selectedCompanyId, setSelectedCompanyId] = useState<string | null>(null);
+  const selectedCompany = useMemo(() => companies.find((c: any) => c?.id === selectedCompanyId) || null, [companies, selectedCompanyId]);
+  const selectedCompanyRole = String((selectedCompany as any)?.role || "member");
 
   // Supabase auth listener
   useEffect(() => {
@@ -1159,7 +1170,7 @@ export default function App() {
     (async () => {
       const { data: memberships, error } = await supabase
         .from("company_memberships")
-        .select("company_id, companies(id, name)")
+        .select("company_id, role, companies(id, name)")
         .eq("user_id", user.id);
 
       if (error) {
@@ -1170,7 +1181,7 @@ export default function App() {
       }
 
       const companyList = (memberships || [])
-        .map((m: any) => m.companies)
+        .map((m: any) => (m.companies ? { ...m.companies, role: m.role } : null))
         .filter(Boolean);
 
       setCompanies(companyList);
@@ -1484,7 +1495,7 @@ const [speciesLibrary, setSpeciesLibrary] = useState<string[]>(() => lsJson(SPEC
         {view === "archive" && <ArchiveView batches={archivedBatches} openBatch={openBatch} unarchiveBatch={unarchiveBatch} />}
         {view === "species" && <LibraryView title="Species Library" items={speciesLibrary} setItems={setSpeciesLibrary} addToast={addToast} />}
         {view === "companies" && <LibraryView title="Companies Library" items={companyLibrary} setItems={setCompanyLibrary} addToast={addToast} />}
-        {view === "settings" && <SettingsView addToast={addToast} />}
+        {view === "settings" && <SettingsView addToast={addToast} user={user} selectedCompany={selectedCompany} companyRole={selectedCompanyRole} />}
       </div>
     </div>
   );
@@ -1558,11 +1569,72 @@ function Header({ view, setView, closeBatch, stats, onLogout, showLogout }: any)
 }
 
 // ─── DASHBOARD ────────────────────────────────────────────────────────────────
+function ConfirmModal({ title, subtitle, confirmText, onConfirm, onCancel, children }: any) {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.55)",
+        display: "grid",
+        placeItems: "center",
+        padding: 16,
+        zIndex: 9999,
+      }}
+      onMouseDown={onCancel}
+    >
+      <div
+        style={{ ...S.card, width: "min(560px, 100%)" }}
+        onMouseDown={(e) => {
+          e.stopPropagation();
+        }}
+      >
+        <div style={S.cardPad}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
+            <div>
+              <div style={{ fontSize: 16, fontWeight: 950, letterSpacing: 0.2 }}>{title}</div>
+              {subtitle ? <div style={{ ...S.small, opacity: 0.6, marginTop: 6 }}>{subtitle}</div> : null}
+            </div>
+            <button style={{ ...S.btn, ...S.btnSecondary, padding: "6px 10px", fontWeight: 900 }} onClick={onCancel}>
+              ✕
+            </button>
+          </div>
+
+          <div style={{ marginTop: 14 }}>{children}</div>
+
+          <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+            <button style={{ ...S.btn, ...S.btnSecondary, flex: 1, padding: "12px" }} onClick={onCancel}>
+              Back
+            </button>
+            <button style={{ ...S.btn, ...S.btnPrimary, flex: 1, padding: "12px", fontWeight: 900 }} onClick={onConfirm}>
+              {confirmText || "Confirm"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Dashboard({ stats, setView }: any) {
+  const [w, setW] = useState<number>(() => (typeof window !== "undefined" ? window.innerWidth : 1200));
+  useEffect(() => {
+    const onR = () => setW(window.innerWidth);
+    window.addEventListener("resize", onR);
+    return () => window.removeEventListener("resize", onR);
+  }, []);
+
+  const cols = w < 720 ? 2 : 4;
+  const valSize = w < 420 ? 26 : 30;
+
   return (
     <div>
-      <h2 style={{ fontSize: 20, fontWeight: 900, marginBottom: 20 }}>Dashboard</h2>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12, marginBottom: 24 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
+        <h2 style={{ fontSize: 20, fontWeight: 950, letterSpacing: 0.2 }}>Dashboard</h2>
+        <div style={{ fontSize: 12, opacity: 0.55, fontWeight: 800 }}>Live overview</div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: `repeat(${cols}, minmax(0,1fr))`, gap: 12, marginBottom: 22 }}>
         {[
           ["Active Batches", stats.total],
           ["Inbound", stats.inbound],
@@ -1571,12 +1643,12 @@ function Dashboard({ stats, setView }: any) {
         ].map(([label, val]) => (
           <div key={label as string} style={S.tile}>
             <div style={S.tileLabel}>{label}</div>
-            <div style={S.tileValue}>{val}</div>
+            <div style={{ ...S.tileValue, fontSize: valSize }}>{val}</div>
           </div>
         ))}
       </div>
       <h3 style={{ fontSize: 14, fontWeight: 800, marginBottom: 12, opacity: 0.7 }}>Quick Actions</h3>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 }}>
+      <div style={{ display: "grid", gridTemplateColumns: `repeat(${cols}, minmax(0,1fr))`, gap: 12 }}>
         {(
           [
             ["inbound", "📥", "Create Inbound", "New incoming docket"],
@@ -1701,6 +1773,7 @@ function OutboundSentView({ batches, openBatch }: any) {
 function CreateDocketView({ batchType, createBatch, speciesLibrary, companyLibrary, addToast, setView }: any) {
   const isInbound = batchType === "inbound";
   const ourCompany = lsGet(OUR_COMPANY_KEY);
+  const ICES_CODES = ["IVa","IVb","IVc","VIa","VIIa","VIIb","VIIc","VIId","VIIe","VIIf","VIIg","VIIh","VIIj","VIIk","VIIIa","VIIIb","VIIIc","VIIId","VIIIe","IXa","Xa","XII","XIV"];
 
   const [fromCompany, setFromCompany] = useState(isInbound ? "" : ourCompany);
   const [toCompany, setToCompany] = useState(isInbound ? ourCompany : "");
@@ -1708,6 +1781,12 @@ function CreateDocketView({ batchType, createBatch, speciesLibrary, companyLibra
   const [orderDate, setOrderDate] = useState(new Date().toISOString().slice(0, 10));
   const [lotRef, setLotRef] = useState("");
   const [notes, setNotes] = useState("");
+  const [icesAreaCode, setIcesAreaCode] = useState<string>("");
+
+  const [transportCompany, setTransportCompany] = useState("");
+  const [vehicleReg, setVehicleReg] = useState("");
+  const [handoverTime, setHandoverTime] = useState("");
+  const [vehicleRegPhoto, setVehicleRegPhoto] = useState<string>("");
 
   const [landingPort, setLandingPort] = useState("");
   const [processingPlant, setProcessingPlant] = useState("");
@@ -1719,11 +1798,32 @@ function CreateDocketView({ batchType, createBatch, speciesLibrary, companyLibra
   const [speciesLines, setSpeciesLines] = useState<SpeciesLine[]>([{ species: "", weightKg: 0 }]);
   const [showCompliance, setShowCompliance] = useState(false);
 
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [draftBatch, setDraftBatch] = useState<Batch | null>(null);
+
   const addSpecies = () => setSpeciesLines((p: SpeciesLine[]) => [...p, { species: "", weightKg: 0 }]);
   const removeSpecies = (i: number) => setSpeciesLines((p: SpeciesLine[]) => p.filter((_, idx) => idx !== i));
   const updateSpecies = (i: number, f: keyof SpeciesLine, v: any) =>
     setSpeciesLines((p: SpeciesLine[]) => p.map((l, idx) => (idx === i ? { ...l, [f]: v } : l)));
 
+
+const readPhotoAsDataUrl = (file: File) =>
+  new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("Could not read file"));
+    reader.readAsDataURL(file);
+  });
+
+const handleVehiclePhotoChange = async (file: File | null) => {
+  if (!file) return;
+  try {
+    const url = await readPhotoAsDataUrl(file);
+    setVehicleRegPhoto(url);
+  } catch (e: any) {
+    addToast("error", e?.message || "Could not read photo");
+  }
+};
   const totalWeight = round2(speciesLines.reduce((a, l) => a + (+l.weightKg || 0), 0));
 
   const handleCreate = () => {
@@ -1749,7 +1849,11 @@ function CreateDocketView({ batchType, createBatch, speciesLibrary, companyLibra
       lotRef,
       notes,
       speciesLines: speciesLines.map((l) => ({ ...l, weightKg: Number(l.weightKg) })).filter((l) => l.species),
-      transportLegs: [],
+      icesAreaCode: icesAreaCode || undefined,
+      transportLegs:
+        transportCompany || vehicleReg || handoverTime || vehicleRegPhoto
+          ? [{ transportCompany, vehicleReg, handoverTime, vehicleRegPhoto }]
+          : [],
       landingPort,
       processingPlant,
       catchCertNo,
@@ -1759,7 +1863,15 @@ function CreateDocketView({ batchType, createBatch, speciesLibrary, companyLibra
       locked: false,
     };
 
-    createBatch(batch);
+    setDraftBatch(batch);
+    setConfirmOpen(true);
+  };
+
+  const confirmCreate = () => {
+    if (!draftBatch) return;
+    createBatch(draftBatch);
+    setConfirmOpen(false);
+    setDraftBatch(null);
     setView("batches");
   };
 
@@ -1798,6 +1910,52 @@ function CreateDocketView({ batchType, createBatch, speciesLibrary, companyLibra
             <label style={S.label}>Lot / Batch Ref</label>
             <input style={S.input} value={lotRef} onChange={(e) => setLotRef(e.target.value)} placeholder="e.g. LOT-001" />
           </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12, marginTop: 12 }}>
+          <div>
+            <label style={S.label}>ICES Area Code (optional)</label>
+            <select style={S.input as any} value={icesAreaCode} onChange={(e) => setIcesAreaCode(e.target.value)}>
+              <option value="">— Select —</option>
+              {ICES_CODES.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label style={S.label}>Transport Company (optional)</label>
+            <input style={S.input} value={transportCompany} onChange={(e) => setTransportCompany(e.target.value)} placeholder="e.g. ABC Logistics" />
+          </div>
+          <div>
+            <label style={S.label}>Vehicle Reg (optional)</label>
+            <input style={S.input} value={vehicleReg} onChange={(e) => setVehicleReg(e.target.value)} placeholder="e.g. AB12 CDE" />
+          </div>
+          <div>
+            <label style={S.label}>Handover Time (optional)</label>
+            <input style={S.input} value={handoverTime} onChange={(e) => setHandoverTime(e.target.value)} placeholder="e.g. 08:45" />
+          </div>
+        </div>
+
+        <div style={{ marginTop: 12 }}>
+          <label style={S.label}>Transport Registration Photo (optional)</label>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <input
+              type="file"
+              accept="image/*"
+              capture="environment"
+              onChange={(e) => handleVehiclePhotoChange(e.target.files?.[0] || null)}
+              style={{ color: "#E8EDF5" }}
+            />
+            {vehicleRegPhoto ? (
+              <>
+                <img src={vehicleRegPhoto} alt="Vehicle reg" style={{ width: 92, height: 62, objectFit: "cover", borderRadius: 10, border: "1px solid rgba(255,255,255,0.12)" }} />
+                <button type="button" style={{ ...S.btnSm, ...S.btnGhost }} onClick={() => setVehicleRegPhoto("")}>
+                  Remove photo
+                </button>
+              </>
+            ) : null}
+          </div>
+          <div style={{ ...S.mini, marginTop: 6, opacity: 0.7 }}>Tip: On phone, this will offer Camera so you can take it on the spot.</div>
         </div>
 
         <div style={S.divider} />
@@ -1899,6 +2057,59 @@ function CreateDocketView({ batchType, createBatch, speciesLibrary, companyLibra
             Draft only. For outbound, you must <b>Confirm Shipment</b> inside the batch before it becomes “Sent / In Transit”.
           </div>
         </div>
+
+        {confirmOpen && draftBatch && (
+          <ConfirmModal
+            title="Confirm docket details"
+            subtitle="Please review before creating. This creates a Draft docket."
+            confirmText="Confirm & Create"
+            onCancel={() => {
+              setConfirmOpen(false);
+              setDraftBatch(null);
+            }}
+            onConfirm={confirmCreate}
+          >
+            <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 10 }}>
+              <div style={S.kvRow}>
+                <div style={S.kvKey}>Type</div>
+                <div style={S.kvVal}>{cap(draftBatch.batchType)}</div>
+              </div>
+              <div style={S.kvRow}>
+                <div style={S.kvKey}>From</div>
+                <div style={S.kvVal}>{draftBatch.fromCompany}</div>
+              </div>
+              <div style={S.kvRow}>
+                <div style={S.kvKey}>To</div>
+                <div style={S.kvVal}>{draftBatch.toCompany}</div>
+              </div>
+              <div style={S.kvRow}>
+                <div style={S.kvKey}>Order date</div>
+                <div style={S.kvVal}>{fmtDate(draftBatch.orderDate)}</div>
+              </div>
+              {draftBatch.lotRef ? (
+                <div style={S.kvRow}>
+                  <div style={S.kvKey}>Lot ref</div>
+                  <div style={S.kvVal}>{draftBatch.lotRef}</div>
+                </div>
+              ) : null}
+              <div style={S.kvRow}>
+                <div style={S.kvKey}>Total weight</div>
+                <div style={{ ...S.kvVal, color: "#F97316" }}>{round2(totalKg(draftBatch))} kg</div>
+              </div>
+              <div style={{ ...S.card, padding: 12 }}>
+                <div style={{ fontSize: 11, opacity: 0.6, fontWeight: 900, marginBottom: 8 }}>Species</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {draftBatch.speciesLines.map((l, i) => (
+                    <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}>
+                      <div style={{ fontWeight: 800 }}>{l.species}</div>
+                      <div style={{ fontFamily: "monospace", opacity: 0.8 }}>{round2(l.weightKg)} kg</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </ConfirmModal>
+        )}
       </div>
     </div>
   );
@@ -2308,47 +2519,173 @@ function LibraryView({ title, items, setItems, addToast }: any) {
 }
 
 // ─── SETTINGS ─────────────────────────────────────────────────────────────────
-function SettingsView({ addToast }: any) {
-  const [ourCompany, setOurCompany] = useState(lsGet(OUR_COMPANY_KEY));
-  const save = () => {
-    lsSet(OUR_COMPANY_KEY, ourCompany.trim());
-    addToast("success", "Settings saved");
+function SettingsView({ addToast, user, selectedCompany, companyRole }: any) {
+  const [activeTab, setActiveTab] = useState<"employee" | "company">(companyRole === "admin" ? "company" : "employee");
+  const [saving, setSaving] = useState(false);
+
+  // Employee profile
+  const [fullName, setFullName] = useState<string>("");
+  const email = String(user?.email || user?.user_metadata?.email || "");
+
+  // Company settings
+  const [companyName, setCompanyName] = useState<string>(String(selectedCompany?.name || ""));
+
+  // Load profile + keep company name in sync when switching companies
+  useEffect(() => {
+    setCompanyName(String(selectedCompany?.name || ""));
+  }, [selectedCompany?.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      // Default from auth metadata while loading
+      const metaName = String(user?.user_metadata?.full_name || user?.user_metadata?.name || "");
+      if (!cancelled) setFullName(metaName);
+
+      if (!supabase || !user?.id) return;
+
+      const { data, error } = await supabase
+        .from("user_profiles")
+        .select("full_name")
+        .eq("id", user.id)
+        .maybeSingle();
+
+      if (!cancelled) {
+        if (!error && data?.full_name != null) setFullName(String(data.full_name));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id]);
+
+  const saveEmployee = async () => {
+    setSaving(true);
+    try {
+      if (supabase && user?.id) {
+        // Update auth metadata (so it follows the user)
+        await supabase.auth.updateUser({ data: { full_name: fullName } });
+
+        // Update profile table (for querying/reporting)
+        const { error } = await supabase.from("user_profiles").update({ full_name: fullName }).eq("id", user.id);
+        if (error) throw error;
+      } else {
+        // Local fallback
+        lsSet("BIDP_EMPLOYEE_FULLNAME", fullName);
+      }
+      addToast("success", "Employee settings saved");
+    } catch (e: any) {
+      addToast("error", e?.message || "Failed to save employee settings");
+    } finally {
+      setSaving(false);
+    }
   };
+
+  const saveCompany = async () => {
+    setSaving(true);
+    try {
+      if (!selectedCompany?.id) throw new Error("No company selected");
+
+      if (supabase) {
+        // Attempt DB update (will fail if RLS disallows; we show a clean message)
+        const { error } = await supabase.from("companies").update({ name: companyName.trim() }).eq("id", selectedCompany.id);
+        if (error) throw error;
+      } else {
+        // Local fallback
+        lsSet(OUR_COMPANY_KEY, companyName.trim());
+      }
+
+      addToast("success", "Company settings saved");
+    } catch (e: any) {
+      addToast("error", e?.message || "Failed to save company settings");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const tabBtn = (isActive: boolean) => ({
+    ...S.btn,
+    ...S.btnSecondary,
+    width: "auto",
+    marginBottom: 0,
+    padding: "8px 12px",
+    borderRadius: 10,
+    background: isActive ? "rgba(249,115,22,0.12)" : "rgba(255,255,255,0.03)",
+    borderColor: isActive ? "rgba(249,115,22,0.5)" : "rgba(255,255,255,0.1)",
+    color: isActive ? "#F97316" : "#E8EDF5",
+  });
+
   return (
     <div style={S.card}>
       <div style={S.cardPad}>
-        <h2 style={{ ...S.h2, marginBottom: 16 }}>Settings</h2>
-
-        <div style={{ marginBottom: 16 }}>
-          <label style={S.label}>Your Company Name</label>
-          <input style={S.input} value={ourCompany} onChange={(e) => setOurCompany(e.target.value)} placeholder="e.g. Portavogie Fish Co." />
-          <p style={{ ...S.small, marginTop: 6, opacity: 0.55 }}>Used to auto-fill the "From" or "To" field when creating dockets.</p>
+        <h2 style={{ ...S.h2, marginBottom: 10 }}>Settings</h2>
+        <div style={{ ...S.small, opacity: 0.7, marginBottom: 16 }}>
+          {companyRole === "admin" ? "Company admin + employee profile" : "Employee profile settings"}
         </div>
 
-        <div style={{ marginBottom: 16, padding: 12, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 10, fontSize: 13 }}>
-          <strong>Resolver URL:</strong>
-          <br />
-          <span style={{ fontFamily: "monospace", fontSize: 11, opacity: 0.7 }}>{RESOLVER_BASE}/?receipt=ID&d=ENCODED</span>
-          <p style={{ marginTop: 6, opacity: 0.55, fontSize: 12 }}>QR codes point here. External “Confirm Receipt” requires Supabase configured.</p>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 16 }}>
+          {companyRole === "admin" && (
+            <button type="button" style={tabBtn(activeTab === "company")} onClick={() => setActiveTab("company")}>
+              Company Settings
+            </button>
+          )}
+          <button type="button" style={tabBtn(activeTab === "employee")} onClick={() => setActiveTab("employee")}>
+            Employee Settings
+          </button>
         </div>
 
-        <div style={{ marginBottom: 16, padding: 12, background: "rgba(59,130,246,0.08)", border: "1px solid rgba(59,130,246,0.18)", borderRadius: 10, fontSize: 13 }}>
-          <strong>Supabase status:</strong>{" "}
-          <span style={{ fontWeight: 900 }}>{SUPABASE_URL && SUPABASE_ANON ? "Configured ✅" : "Not configured (local-only) ⚠️"}</span>
-          <div style={{ marginTop: 6, opacity: 0.65, fontSize: 12, lineHeight: 1.5 }}>
-            If not configured, batches are localStorage only and external receipt confirmation cannot update your system.
+        {companyRole === "admin" && activeTab === "company" && (
+          <div style={S.subCard}>
+            <div style={{ ...S.small, opacity: 0.8, marginBottom: 10 }}>
+              These settings affect the whole company workspace.
+            </div>
+
+            <label style={S.label}>Company Name</label>
+            <input
+              style={S.input}
+              value={companyName}
+              onChange={(e) => setCompanyName(e.target.value)}
+              placeholder="e.g. Portavogie Fish Co."
+            />
+
+            <div style={{ height: 10 }} />
+            <button type="button" style={{ ...S.btn, ...S.btnPrimary, marginBottom: 0 }} onClick={saveCompany} disabled={saving}>
+              {saving ? "Saving..." : "Save Company Settings"}
+            </button>
+
+            <div style={{ ...S.small, opacity: 0.6, marginTop: 10 }}>
+              If you see a permissions error, add an UPDATE policy for <b>public.companies</b> for admins.
+            </div>
           </div>
-        </div>
+        )}
 
-        <button style={{ ...S.btn, ...S.btnPrimary, fontWeight: 900 }} onClick={save}>
-          Save Settings
-        </button>
+        {activeTab === "employee" && (
+          <div style={S.subCard}>
+            <div style={{ ...S.small, opacity: 0.8, marginBottom: 10 }}>
+              These settings follow the logged-in employee account.
+            </div>
+
+            <label style={S.label}>Email</label>
+            <input style={{ ...S.input, opacity: 0.7 }} value={email} readOnly />
+
+            <div style={{ height: 10 }} />
+
+            <label style={S.label}>Full Name</label>
+            <input style={S.input} value={fullName} onChange={(e) => setFullName(e.target.value)} placeholder="e.g. Ryan Whilby" />
+
+            <div style={{ height: 10 }} />
+            <button type="button" style={{ ...S.btn, ...S.btnPrimary, marginBottom: 0 }} onClick={saveEmployee} disabled={saving}>
+              {saving ? "Saving..." : "Save Employee Settings"}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
-// ─── STYLES ───────────────────────────────────────────────────────────────────
 const S = {
   app: { minHeight: "100vh", background: "#080D14", color: "#E8EDF5", fontFamily: "system-ui,sans-serif" },
   header: {
@@ -2410,6 +2747,9 @@ const S = {
   btnPrimary: { background: "rgba(249,115,22,0.2)", borderColor: "rgba(249,115,22,0.4)", color: "#F97316" },
   btnSecondary: { background: "rgba(255,255,255,0.03)", borderColor: "rgba(255,255,255,0.1)" },
   btnDanger: { background: "rgba(239,68,68,0.15)", borderColor: "rgba(239,68,68,0.3)", color: "#EF4444" },
+  btnSm: { padding: "8px 10px", fontSize: 12, borderRadius: 10 },
+  btnGhost: { background: "rgba(255,255,255,0.04)", borderColor: "rgba(255,255,255,0.12)", color: "#E8EDF5" },
+  mini: { fontSize: 12, color: "rgba(232,237,245,0.7)" },
   navBtn: {
     cursor: "pointer",
     background: "rgba(255,255,255,0.03)",
@@ -2432,19 +2772,41 @@ const S = {
     fontWeight: 800,
   },
   tabBtnActive: { borderColor: "rgba(249,115,22,0.5)", background: "rgba(249,115,22,0.12)", color: "#F97316" },
-  tile: { background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 14, padding: 16 },
-  tileLabel: { fontSize: 12, opacity: 0.6, marginBottom: 8 },
-  tileValue: { fontSize: 30, fontWeight: 900 },
+  tile: {
+    background: "linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.015))",
+    border: "1px solid rgba(255,255,255,0.07)",
+    borderRadius: 16,
+    padding: 16,
+    boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
+    minHeight: 92,
+    display: "flex",
+    flexDirection: "column" as const,
+    justifyContent: "space-between",
+  },
+  tileLabel: { fontSize: 12, opacity: 0.65, marginBottom: 6, fontWeight: 800 },
+  tileValue: { fontSize: 30, fontWeight: 950, lineHeight: 1.05, letterSpacing: -0.2 },
   actionTile: {
     cursor: "pointer",
-    background: "rgba(255,255,255,0.02)",
-    border: "1px solid rgba(255,255,255,0.06)",
+    background: "linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.015))",
+    border: "1px solid rgba(255,255,255,0.07)",
     color: "#E8EDF5",
-    borderRadius: 14,
+    borderRadius: 16,
     padding: 20,
     textAlign: "center" as const,
     width: "100%",
+    boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
   },
+
+  kvRow: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+    padding: "8px 0",
+    borderBottom: "1px solid rgba(255,255,255,0.05)",
+  },
+  kvKey: { fontSize: 12, opacity: 0.6, fontWeight: 900 },
+  kvVal: { fontSize: 13, fontWeight: 900, textAlign: "right" as const },
   typeBadge: (t: BatchType) => ({
     display: "inline-flex",
     alignItems: "center",
