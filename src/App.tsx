@@ -1,10 +1,19 @@
-// Batch ID Pro — Single-File App (V1.1 — CONFIRM + LOCK + QR RECEIPT CONFIRM + LOGOUT + SUPABASE)
+// Batch ID Pro — Single-File App (V1.1 — CONFIRM + LOCK + QR RECEIPT CONFIRM + LOGOUT + (OPTIONAL) SUPABASE)
 // QR codes point to resolver at https://batch.coresystemsni.com/?receipt=ID&d=ENCODED
 // No router. Vite + React. TypeScript-safe.
+//
+// Key rules implemented:
+// - Creating a docket = DRAFT ("Created").
+// - Outbound "Confirm Shipment" moves to "In Transit" (a.k.a. SENT) and LOCKS the batch (no edits/deletes/flow changes).
+// - Recipient confirms receipt via external docket (QR receipt page) => "Completed" + receivedAt, stays locked.
+// - Outbound view shows SENT only (In Transit + Completed).
+// - Logout + auth gate when Supabase is configured.
+// - Hybrid persistence: Supabase when configured, else localStorage fallback.
+//   NOTE: External receipt confirmation only truly works with Supabase because a phone scanning QR does not share your localStorage.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { createClient, type Session } from "@supabase/supabase-js";
+import { createClient, type Session, type User } from "@supabase/supabase-js";
 
 /* ---------- localStorage helpers (BUILD-SAFE) ---------- */
 function lsGet(key: string): string {
@@ -47,36 +56,51 @@ const LOGO_URL =
   "https://res.cloudinary.com/dmnuqcykq/image/upload/v1770027904/ChatGPT_Image_Feb_2_2026_10_24_54_AM_f99qva.png";
 const APP_NAME = "Batch ID Pro";
 
-// ─── SUPABASE (CONFIGURED) — HARDENED ENV VAR EXTRACTION ──────────────────────
-function getEnvVar(key: string): string | undefined {
-  try {
-    const val = (import.meta as any).env?.[key];
-    if (typeof val === 'string' && val.trim().length > 0) {
-      return val.trim();
-    }
-    return undefined;
-  } catch {
-    return undefined;
-  }
-}
+// ─── SUPABASE (OPTIONAL) ─────────────────────────────────────────────────────
+const SUPABASE_URL_RAW = (import.meta as any).env?.VITE_SUPABASE_URL as string | undefined;
+const SUPABASE_ANON_RAW = (import.meta as any).env?.VITE_SUPABASE_ANON_KEY as string | undefined;
 
-function isValidHttpUrl(str: string | undefined): str is string {
-  if (!str || typeof str !== 'string') return false;
+// Normalize (handles accidental quotes/whitespace/newlines) and validate early so the whole app never hard-crashes.
+const normalizeEnv = (v?: string) => (typeof v === 'string' ? v.trim().replace(/^['"]|['"]$/g, '') : undefined);
+
+const SUPABASE_URL = normalizeEnv(SUPABASE_URL_RAW)?.replace(/\/+$/g, '');
+const SUPABASE_ANON = normalizeEnv(SUPABASE_ANON_RAW);
+
+const isValidHttpUrl = (u?: string) => {
+  if (!u) return false;
   try {
-    const url = new URL(str);
-    return url.protocol === 'http:' || url.protocol === 'https:';
+    const url = new URL(u);
+    return url.protocol === 'https:' || url.protocol === 'http:';
   } catch {
     return false;
   }
-}
+};
 
-const SUPABASE_URL = getEnvVar('VITE_SUPABASE_URL');
-const SUPABASE_ANON = getEnvVar('VITE_SUPABASE_ANON_KEY');
-
-const supabase =
-  isValidHttpUrl(SUPABASE_URL) && SUPABASE_ANON && SUPABASE_ANON.length > 20
-    ? createClient(SUPABASE_URL, SUPABASE_ANON, { auth: { persistSession: true } })
-    : null;
+const supabase = (() => {
+  if (!SUPABASE_URL || !SUPABASE_ANON) return null;
+  if (!isValidHttpUrl(SUPABASE_URL)) {
+    console.error('[Batch ID Pro] Invalid SUPABASE URL (needs https://...). Value seen:', SUPABASE_URL);
+    return null;
+  }
+  try {
+    return createClient(SUPABASE_URL, SUPABASE_ANON, { auth: { persistSession: true } });
+  } catch (e) {
+    console.error('[Batch ID Pro] Supabase init failed:', e);
+    return null;
+  }
+})();
+// Table expected (minimal):
+// batches:
+//  - id (text primary key)
+//  - data (jsonb)   // full batch object
+//  - status (text)
+//  - batch_type (text)
+//  - from_company (text)
+//  - to_company (text)
+//  - sent_at (timestamptz null)
+//  - received_at (timestamptz null)
+//  - locked (bool default false)
+//  - updated_at (timestamptz default now())
 
 // ─── TYPES ───────────────────────────────────────────────────────────────────
 type BatchType = "inbound" | "outbound";
@@ -124,9 +148,10 @@ interface Batch {
   landingPort?: string;
   processingPlant?: string;
 
-  sentAt?: string;
-  receivedAt?: string;
-  locked?: boolean;
+  // NEW: workflow timestamps + lock
+  sentAt?: string; // when shipment confirmed (outbound)
+  receivedAt?: string; // when recipient confirms (external)
+  locked?: boolean; // true once "In Transit" (or completed) to prevent changes
 }
 
 // ─── STORAGE ─────────────────────────────────────────────────────────────────
@@ -134,6 +159,8 @@ const STORAGE_KEY = "batchidpro_v1";
 const OUR_COMPANY_KEY = "batchidpro_ourcompany";
 const SPECIES_KEY = "batchidpro_species";
 const COMPANY_KEY = "batchidpro_companies";
+
+// optional: local "session" for non-supabase mode (basic logout)
 const LOCAL_SESSION_KEY = "batchidpro_local_session";
 
 const DEFAULT_SPECIES = [
@@ -165,11 +192,59 @@ const DEFAULT_COMPANIES = [
   "ColdRun Ltd",
 ];
 
-function loadBatches(): Batch[] {
+// Local fallback (only used when Supabase is not configured)
+function loadBatchesLocal(): Batch[] {
   return lsJson<Batch[]>(STORAGE_KEY, []);
 }
-function saveBatches(b: Batch[]) {
+function saveBatchesLocal(b: Batch[]) {
   lsSet(STORAGE_KEY, JSON.stringify(b));
+}
+
+// Supabase-backed batches (per your schema)
+async function loadBatches(companyId: string): Promise<Batch[]> {
+  if (!supabase) return loadBatchesLocal();
+
+  const { data, error } = await supabase
+    .from("batches")
+    .select("*")
+    .eq("company_id", companyId)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    console.error("Error loading batches:", error);
+    return [];
+  }
+
+  return (data || []).map((r: any) => {
+    const status = (r.status as BatchStatus) || "Created";
+    const updatedAt = r.updated_at || r.created_at || new Date().toISOString();
+    return {
+      id: String(r.id),
+      batchType: r.batch_type as BatchType,
+      status,
+      createdAt: r.created_at || new Date().toISOString(),
+      updatedAt,
+      fromCompany: r.from_company || "",
+      toCompany: r.to_company || "",
+      vesselRef: r.vessel_ref || "",
+      orderDate: r.order_date || "",
+      lotRef: r.lot_ref || "",
+      notes: r.notes || "",
+      speciesLines: (r.species_lines || []) as SpeciesLine[],
+      transportLegs: (r.transport_legs || []) as TransportLeg[],
+      archived: !!r.archived,
+      landingCertNo: r.landing_cert_no || "",
+      processingCertNo: r.processing_cert_no || "",
+      catchCertNo: r.catch_cert_no || "",
+      healthCertNo: r.health_cert_no || "",
+      landingPort: r.landing_port || "",
+      processingPlant: r.processing_plant || "",
+      // Derived (schema-safe)
+      locked: status !== "Created",
+      sentAt: status === "In Transit" ? updatedAt : undefined,
+      receivedAt: status === "Completed" ? updatedAt : undefined,
+    } as Batch;
+  });
 }
 
 // ─── UTILS ───────────────────────────────────────────────────────────────────
@@ -204,6 +279,7 @@ const speciesSummary = (b: Batch) => {
   return lines.length === 1 ? lines[0].species : `${lines[0].species} +${lines.length - 1}`;
 };
 
+// Receipt data encoding (for redundancy on QR)
 function encodeBatch(batch: Batch): string {
   try {
     const d = {
@@ -251,20 +327,31 @@ function safeDecode(encoded: string): any | null {
 }
 
 // ─── SUPABASE HELPERS ────────────────────────────────────────────────────────
-async function sbUpsertBatch(batch: Batch): Promise<{ ok: boolean; error?: string }> {
+async function sbUpsertBatch(companyId: string, batch: Batch): Promise<{ ok: boolean; error?: string }> {
   if (!supabase) return { ok: false, error: "Supabase not configured" };
   try {
-    const payload = {
+    const payload: any = {
       id: batch.id,
-      data: batch,
-      status: batch.status,
+      company_id: companyId,
       batch_type: batch.batchType,
+      status: batch.status,
+      created_at: batch.createdAt,
+      updated_at: batch.updatedAt,
       from_company: batch.fromCompany,
       to_company: batch.toCompany,
-      sent_at: batch.sentAt ?? null,
-      received_at: batch.receivedAt ?? null,
-      locked: !!batch.locked,
-      updated_at: new Date().toISOString(),
+      vessel_ref: batch.vesselRef || null,
+      order_date: batch.orderDate,
+      lot_ref: batch.lotRef || null,
+      notes: batch.notes || null,
+      species_lines: batch.speciesLines || [],
+      transport_legs: batch.transportLegs || [],
+      archived: !!batch.archived,
+      landing_cert_no: batch.landingCertNo || null,
+      processing_cert_no: batch.processingCertNo || null,
+      catch_cert_no: batch.catchCertNo || null,
+      health_cert_no: batch.healthCertNo || null,
+      landing_port: batch.landingPort || null,
+      processing_plant: batch.processingPlant || null,
     };
 
     const { error } = await supabase.from("batches").upsert(payload, { onConflict: "id" });
@@ -278,10 +365,39 @@ async function sbUpsertBatch(batch: Batch): Promise<{ ok: boolean; error?: strin
 async function sbFetchBatchById(id: string): Promise<{ ok: boolean; batch?: Batch; error?: string }> {
   if (!supabase) return { ok: false, error: "Supabase not configured" };
   try {
-    const { data, error } = await supabase.from("batches").select("data").eq("id", id).maybeSingle();
+    const { data, error } = await supabase.from("batches").select("*").eq("id", id).maybeSingle();
     if (error) return { ok: false, error: error.message };
-    const b = (data?.data ?? null) as Batch | null;
-    if (!b) return { ok: false, error: "Not found" };
+    if (!data) return { ok: false, error: "Not found" };
+
+    const status = (data.status as BatchStatus) || "Created";
+    const updatedAt = data.updated_at || data.created_at || new Date().toISOString();
+
+    const b: Batch = {
+      id: String(data.id),
+      batchType: data.batch_type as BatchType,
+      status,
+      createdAt: data.created_at || new Date().toISOString(),
+      updatedAt,
+      fromCompany: data.from_company || "",
+      toCompany: data.to_company || "",
+      vesselRef: data.vessel_ref || "",
+      orderDate: data.order_date || "",
+      lotRef: data.lot_ref || "",
+      notes: data.notes || "",
+      speciesLines: (data.species_lines || []) as SpeciesLine[],
+      transportLegs: (data.transport_legs || []) as TransportLeg[],
+      archived: !!data.archived,
+      landingCertNo: data.landing_cert_no || "",
+      processingCertNo: data.processing_cert_no || "",
+      catchCertNo: data.catch_cert_no || "",
+      healthCertNo: data.health_cert_no || "",
+      landingPort: data.landing_port || "",
+      processingPlant: data.processing_plant || "",
+      locked: status !== "Created",
+      sentAt: status === "In Transit" ? updatedAt : undefined,
+      receivedAt: status === "Completed" ? updatedAt : undefined,
+    };
+
     return { ok: true, batch: b };
   } catch (e: any) {
     return { ok: false, error: e?.message || "Unknown error" };
@@ -290,25 +406,35 @@ async function sbFetchBatchById(id: string): Promise<{ ok: boolean; batch?: Batc
 
 async function sbConfirmReceipt(id: string): Promise<{ ok: boolean; batch?: Batch; error?: string }> {
   if (!supabase) return { ok: false, error: "Supabase not configured" };
+
   const f = await sbFetchBatchById(id);
   if (!f.ok || !f.batch) return { ok: false, error: f.error || "Not found" };
+
   const b = f.batch;
 
-  if (b.status !== "In Transit") {
-    return { ok: false, error: `Cannot confirm receipt because status is ${b.status}` };
-  }
+  // Only allow confirming if currently "In Transit" (or at least not Archived)
+  if (b.status === "Archived") return { ok: false, error: "This docket is archived." };
 
-  const updated: Batch = {
+  const next: Batch = {
     ...b,
     status: "Completed",
-    receivedAt: nowISO(),
+    updatedAt: new Date().toISOString(),
     locked: true,
-    updatedAt: nowISO(),
+    receivedAt: new Date().toISOString(),
   };
 
-  const u = await sbUpsertBatch(updated);
-  if (!u.ok) return { ok: false, error: u.error || "Update failed" };
-  return { ok: true, batch: updated };
+  try {
+    // Update row by id (no company context required)
+    const { error } = await supabase
+      .from("batches")
+      .update({ status: next.status, updated_at: next.updatedAt, archived: false })
+      .eq("id", id);
+
+    if (error) return { ok: false, error: error.message };
+    return { ok: true, batch: next };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || "Unknown error" };
+  }
 }
 
 // ─── WORKFLOW GUARDS ─────────────────────────────────────────────────────────
@@ -318,120 +444,6 @@ function isLocked(b: Batch): boolean {
 function canConfirmShipment(b: Batch): boolean {
   return b.batchType === "outbound" && b.status === "Created" && !isLocked(b);
 }
-
-// ─── STYLES ──────────────────────────────────────────────────────────────────
-const S = {
-  app: {
-    minHeight: "100vh",
-    background: "#080D14",
-    color: "#E8EDF5",
-    fontFamily: "system-ui, -apple-system, sans-serif",
-  },
-  container: { maxWidth: 1200, margin: "0 auto", padding: "24px 16px 80px" },
-  header: {
-    background: "rgba(255,255,255,0.03)",
-    borderBottom: "1px solid rgba(255,255,255,0.08)",
-    padding: "12px 16px",
-    display: "flex",
-    alignItems: "center",
-    gap: 14,
-  },
-  logo: { height: 38, borderRadius: 8 },
-  appName: { fontSize: 16, fontWeight: 900 },
-  nav: { display: "flex", gap: 8, marginLeft: "auto", flexWrap: "wrap" as const },
-  navBtn: {
-    cursor: "pointer",
-    padding: "8px 14px",
-    borderRadius: 10,
-    border: "1px solid rgba(255,255,255,0.1)",
-    background: "rgba(255,255,255,0.04)",
-    color: "#E8EDF5",
-    fontSize: 13,
-    fontWeight: 700,
-  },
-  navBtnActive: {
-    borderColor: "rgba(249,115,22,0.35)",
-    background: "rgba(249,115,22,0.14)",
-    color: "#F97316",
-  },
-  card: {
-    background: "rgba(255,255,255,0.03)",
-    border: "1px solid rgba(255,255,255,0.08)",
-    borderRadius: 16,
-    overflow: "hidden" as const,
-  },
-  cardPad: { padding: 20 },
-  cardHead: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: 14,
-  },
-  cardTitle: { fontSize: 16, fontWeight: 900 },
-  btn: {
-    cursor: "pointer",
-    padding: "9px 14px",
-    borderRadius: 10,
-    border: "1px solid rgba(255,255,255,0.14)",
-    background: "rgba(255,255,255,0.06)",
-    color: "#E8EDF5",
-    fontSize: 13,
-    fontWeight: 700,
-  },
-  btnPrimary: {
-    borderColor: "rgba(249,115,22,0.45)",
-    background: "rgba(249,115,22,0.18)",
-    color: "#F97316",
-  },
-  btnSecondary: {
-    borderColor: "rgba(59,130,246,0.45)",
-    background: "rgba(59,130,246,0.14)",
-    color: "#3B82F6",
-  },
-  btnDanger: {
-    borderColor: "rgba(239,68,68,0.45)",
-    background: "rgba(239,68,68,0.14)",
-    color: "#EF4444",
-  },
-  btnOk: {
-    borderColor: "rgba(34,197,94,0.45)",
-    background: "rgba(34,197,94,0.14)",
-    color: "#22C55E",
-  },
-  input: {
-    width: "100%",
-    padding: "10px 12px",
-    borderRadius: 10,
-    border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(255,255,255,0.04)",
-    color: "#E8EDF5",
-    fontSize: 14,
-  },
-  label: {
-    display: "block",
-    fontSize: 11,
-    fontWeight: 800,
-    letterSpacing: 1,
-    textTransform: "uppercase" as const,
-    opacity: 0.6,
-    marginBottom: 6,
-  },
-  tabBtn: {
-    cursor: "pointer",
-    padding: "8px 14px",
-    borderRadius: 10,
-    border: "1px solid rgba(255,255,255,0.1)",
-    background: "rgba(255,255,255,0.04)",
-    color: "#E8EDF5",
-    fontSize: 13,
-    fontWeight: 700,
-  },
-  tabBtnActive: {
-    borderColor: "rgba(249,115,22,0.35)",
-    background: "rgba(249,115,22,0.14)",
-    color: "#F97316",
-  },
-};
 
 // ─── PUBLIC RECEIPT PAGE ─────────────────────────────────────────────────────
 function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: string | null }) {
@@ -457,8 +469,10 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
       setErr("");
       setDone(false);
 
+      // 1) Try encoded payload first (instant render)
       const okEncoded = setFromEncoded();
 
+      // 2) If Supabase configured, fetch live record so confirm receipt works
       if (supabase) {
         const f = await sbFetchBatchById(receiptId);
         if (mounted) {
@@ -469,6 +483,7 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
           }
         }
       } else {
+        // No Supabase; if encoded failed, we can’t do anything.
         if (mounted && !okEncoded)
           setErr("Receipt link incomplete (missing encoded data) and no online database configured.");
       }
@@ -635,8 +650,8 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
               <>
                 <div style={{ fontWeight: 800, marginBottom: 8 }}>Online confirmation is not enabled on this build.</div>
                 <div className="hint">
-                  This receipt page is running on a different device. Without Supabase (or another database), it cannot update the sender's system.
-                  Enable Supabase to make "Confirm Receipt" update the batch instantly.
+                  This receipt page is running on a different device. Without Supabase (or another database), it cannot update the sender’s system.
+                  Enable Supabase to make “Confirm Receipt” update the batch instantly.
                 </div>
               </>
             ) : (
@@ -750,1240 +765,337 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
 }
 
 // ─── AUTH UI (SUPABASE) ───────────────────────────────────────────────────────
-function AuthGate({ onAuthed }: { onAuthed: (session: Session) => void }) {
-  const [mode, setMode] = useState<"signin" | "signup">("signin");
+function AuthScreen({ onAuth }: { onAuth: () => void }) {
+  const [mode, setMode] = useState<"signin" | "signup" | "invite">("signin");
   const [email, setEmail] = useState("");
-  const [pass, setPass] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
+  const [password, setPassword] = useState("");
+  const [fullName, setFullName] = useState("");
+  const [companyName, setCompanyName] = useState("");
+  const [inviteCode, setInviteCode] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
 
-  const submit = async () => {
-    if (!supabase) return;
-    setBusy(true);
-    setErr("");
-    try {
-      if (mode === "signin") {
-        const { data, error } = await supabase.auth.signInWithPassword({ email, password: pass });
-        if (error) throw error;
-        if (data.session) onAuthed(data.session);
-      } else {
-        const { data, error } = await supabase.auth.signUp({ email, password: pass });
-        if (error) throw error;
-        if (data.session) onAuthed(data.session);
-        else setErr("Account created. If email confirmation is enabled, check your inbox.");
-      }
-    } catch (e: any) {
-      setErr(e?.message || "Auth failed");
-    } finally {
-      setBusy(false);
+  const handleSignIn = async () => {
+    if (!supabase) {
+      setError("Supabase is not configured.");
+      return;
     }
+    setLoading(true);
+    setError("");
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) setError(error.message);
+    else onAuth();
+    setLoading(false);
   };
 
-  return (
-    <div style={{ ...S.app, display: "grid", placeItems: "center", padding: 16 }}>
-      <div style={{ maxWidth: 520, width: "100%", ...S.card }}>
-        <div style={S.cardPad}>
-          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
-            <img src={LOGO_URL} alt={APP_NAME} style={{ height: 44, borderRadius: 10 }} />
-            <div>
-              <div style={{ fontSize: 16, fontWeight: 900 }}>{APP_NAME}</div>
-              <div style={{ fontSize: 12, opacity: 0.6 }}>Company account login</div>
-            </div>
-          </div>
+  const handleSignUp = async () => {
+    if (!supabase) {
+      setError("Supabase is not configured.");
+      return;
+    }
+    setLoading(true);
+    setError("");
 
-          <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-            <button style={{ ...S.tabBtn, ...(mode === "signin" ? S.tabBtnActive : {}) }} onClick={() => setMode("signin")}>
-              Sign in
-            </button>
-            <button style={{ ...S.tabBtn, ...(mode === "signup" ? S.tabBtnActive : {}) }} onClick={() => setMode("signup")}>
-              Create account
-            </button>
-          </div>
+    const { data: authData, error: authError } = await supabase.auth.signUp({
+      email,
+      password,
+      options: { data: { full_name: fullName } },
+    });
 
-          {err && (
-            <div
-              style={{
-                padding: 10,
-                borderRadius: 12,
-                border: "1px solid rgba(239,68,68,0.35)",
-                background: "rgba(239,68,68,0.12)",
-                marginBottom: 10,
-              }}
-            >
-              <div style={{ fontWeight: 800, color: "#EF4444", fontSize: 13 }}>Error</div>
-              <div style={{ fontSize: 13, opacity: 0.9 }}>{err}</div>
-            </div>
-          )}
-
-          <div style={{ display: "grid", gap: 10 }}>
-            <div>
-              <label style={S.label}>Email (company account)</label>
-              <input style={S.input} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="company@domain.com" />
-            </div>
-            <div>
-              <label style={S.label}>Password</label>
-              <input type="password" style={S.input} value={pass} onChange={(e) => setPass(e.target.value)} placeholder="••••••••" />
-            </div>
-            <button style={{ ...S.btn, ...S.btnPrimary, padding: "12px 14px", fontWeight: 900 }} onClick={submit} disabled={busy || !email || !pass}>
-              {busy ? "Please wait…" : mode === "signin" ? "Sign in" : "Create account"}
-            </button>
-
-            <div style={{ fontSize: 12, opacity: 0.55, lineHeight: 1.5 }}>
-              <b>Multi-user on one account:</b> If you want multiple staff to use one company account, simply share this login internally.
-              If/when you want true multi-user memberships per company, we'll add a membership table + RLS later.
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── TOAST BAR ───────────────────────────────────────────────────────────────
-function ToastBar({ toasts }: { toasts: Toast[] }) {
-  return (
-    <div style={{ position: "fixed", bottom: 20, right: 20, zIndex: 9999, display: "grid", gap: 10 }}>
-      {toasts.map((t) => {
-        const bg = t.type === "success" ? "#22C55E" : t.type === "error" ? "#EF4444" : "#3B82F6";
-        return (
-          <div
-            key={t.id}
-            style={{
-              background: `${bg}22`,
-              border: `1px solid ${bg}55`,
-              color: bg,
-              borderRadius: 12,
-              padding: "10px 14px",
-              fontSize: 13,
-              fontWeight: 800,
-              maxWidth: 320,
-            }}
-          >
-            {t.message}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-// ─── HEADER ──────────────────────────────────────────────────────────────────
-function Header({
-  view,
-  setView,
-  closeBatch,
-  stats,
-  onLogout,
-  showLogout,
-}: {
-  view: View;
-  setView: (v: View) => void;
-  closeBatch: () => void;
-  stats: any;
-  onLogout: () => void;
-  showLogout: boolean;
-}) {
-  return (
-    <div style={S.header}>
-      <img src={LOGO_URL} alt={APP_NAME} style={S.logo} />
-      <div style={S.appName}>{APP_NAME}</div>
-      <div style={S.nav}>
-        <button
-          style={{ ...S.navBtn, ...(view === "dashboard" ? S.navBtnActive : {}) }}
-          onClick={() => {
-            closeBatch();
-            setView("dashboard");
-          }}
-        >
-          Dashboard
-        </button>
-        <button
-          style={{ ...S.navBtn, ...(view === "batches" ? S.navBtnActive : {}) }}
-          onClick={() => {
-            closeBatch();
-            setView("batches");
-          }}
-        >
-          Batches ({stats.total})
-        </button>
-        <button
-          style={{ ...S.navBtn, ...(view === "outbound" ? S.navBtnActive : {}) }}
-          onClick={() => {
-            closeBatch();
-            setView("outbound");
-          }}
-        >
-          Outbound
-        </button>
-        <button
-          style={{ ...S.navBtn, ...(view === "eow" ? S.navBtnActive : {}) }}
-          onClick={() => {
-            closeBatch();
-            setView("eow");
-          }}
-        >
-          EOW ({stats.completed})
-        </button>
-        <button
-          style={{ ...S.navBtn, ...(view === "archive" ? S.navBtnActive : {}) }}
-          onClick={() => {
-            closeBatch();
-            setView("archive");
-          }}
-        >
-          Archive ({stats.archived})
-        </button>
-        {showLogout && (
-          <button style={{ ...S.navBtn, ...S.btnDanger }} onClick={onLogout}>
-            Logout
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ─── DASHBOARD ───────────────────────────────────────────────────────────────
-function Dashboard({ stats, setView }: { stats: any; setView: (v: View) => void }) {
-  return (
-    <div>
-      <h1 style={{ fontSize: 24, fontWeight: 900, marginBottom: 18 }}>Dashboard</h1>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 14 }}>
-        <div style={S.card}>
-          <div style={S.cardPad}>
-            <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 6 }}>Active Batches</div>
-            <div style={{ fontSize: 32, fontWeight: 900 }}>{stats.total}</div>
-          </div>
-        </div>
-        <div style={S.card}>
-          <div style={S.cardPad}>
-            <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 6 }}>Inbound</div>
-            <div style={{ fontSize: 32, fontWeight: 900, color: "#3B82F6" }}>{stats.inbound}</div>
-          </div>
-        </div>
-        <div style={S.card}>
-          <div style={S.cardPad}>
-            <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 6 }}>Outbound</div>
-            <div style={{ fontSize: 32, fontWeight: 900, color: "#F97316" }}>{stats.outbound}</div>
-          </div>
-        </div>
-        <div style={S.card}>
-          <div style={S.cardPad}>
-            <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 6 }}>Completed</div>
-            <div style={{ fontSize: 32, fontWeight: 900, color: "#22C55E" }}>{stats.completed}</div>
-          </div>
-        </div>
-      </div>
-
-      <div style={{ marginTop: 24, display: "grid", gap: 12 }}>
-        <button style={{ ...S.btn, ...S.btnPrimary, padding: "12px 14px", fontWeight: 900 }} onClick={() => setView("inbound")}>
-          + Create Inbound Docket
-        </button>
-        <button style={{ ...S.btn, ...S.btnSecondary, padding: "12px 14px", fontWeight: 900 }} onClick={() => setView("batches")}>
-          View All Batches
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// ─── BATCHES VIEW ────────────────────────────────────────────────────────────
-function BatchesView({
-  batches,
-  tab,
-  setTab,
-  openBatch,
-  deleteBatch,
-}: {
-  batches: Batch[];
-  tab: BatchStatus;
-  setTab: (t: BatchStatus) => void;
-  openBatch: (id: string) => void;
-  deleteBatch: (id: string) => void;
-}) {
-  return (
-    <div>
-      <h1 style={{ fontSize: 24, fontWeight: 900, marginBottom: 18 }}>Batches</h1>
-
-      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
-        <button style={{ ...S.tabBtn, ...(tab === "Created" ? S.tabBtnActive : {}) }} onClick={() => setTab("Created")}>
-          Draft
-        </button>
-        <button style={{ ...S.tabBtn, ...(tab === "In Transit" ? S.tabBtnActive : {}) }} onClick={() => setTab("In Transit")}>
-          In Transit
-        </button>
-      </div>
-
-      {batches.length === 0 && (
-        <div style={{ padding: 32, textAlign: "center", opacity: 0.6 }}>No batches in this status</div>
-      )}
-
-      <div style={{ display: "grid", gap: 12 }}>
-        {batches.map((b) => (
-          <div key={b.id} style={S.card}>
-            <div style={S.cardPad}>
-              <div style={S.cardHead}>
-                <div>
-                  <div style={{ fontSize: 14, fontWeight: 900, marginBottom: 4 }}>{b.id}</div>
-                  <div style={{ fontSize: 12, opacity: 0.6 }}>
-                    {cap(b.batchType)} · {fmtDate(b.createdAt)}
-                  </div>
-                </div>
-                <div
-                  style={{
-                    display: "inline-flex",
-                    padding: "4px 12px",
-                    borderRadius: 999,
-                    fontSize: 11,
-                    fontWeight: 800,
-                    background: b.batchType === "inbound" ? "rgba(59,130,246,0.15)" : "rgba(249,115,22,0.15)",
-                    color: b.batchType === "inbound" ? "#3B82F6" : "#F97316",
-                    border: `1px solid ${b.batchType === "inbound" ? "#3B82F6" : "#F97316"}44`,
-                  }}
-                >
-                  {b.status}
-                </div>
-              </div>
-
-              <div style={{ marginTop: 12, fontSize: 13, opacity: 0.8 }}>
-                <div>
-                  <b>From:</b> {b.fromCompany}
-                </div>
-                <div>
-                  <b>To:</b> {b.toCompany}
-                </div>
-                <div>
-                  <b>Species:</b> {speciesSummary(b)} · <b>{totalKg(b)} kg</b>
-                </div>
-              </div>
-
-              <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
-                <button style={{ ...S.btn, ...S.btnSecondary }} onClick={() => openBatch(b.id)}>
-                  View
-                </button>
-                {!isLocked(b) && (
-                  <button style={{ ...S.btn, ...S.btnDanger }} onClick={() => deleteBatch(b.id)}>
-                    Delete
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ─── CREATE DOCKET VIEW ──────────────────────────────────────────────────────
-function CreateDocketView({
-  batchType,
-  createBatch,
-  speciesLibrary,
-  companyLibrary,
-  addToast,
-  setView,
-}: {
-  batchType: BatchType;
-  createBatch: (b: Batch) => Promise<void>;
-  speciesLibrary: string[];
-  companyLibrary: string[];
-  addToast: (type: Toast["type"], message: string) => void;
-  setView: (v: View) => void;
-}) {
-  const [form, setForm] = useState({
-    fromCompany: "",
-    toCompany: "",
-    vesselRef: "",
-    orderDate: new Date().toISOString().split("T")[0],
-    lotRef: "",
-    notes: "",
-    landingCertNo: "",
-    processingCertNo: "",
-    catchCertNo: "",
-    healthCertNo: "",
-    landingPort: "",
-    processingPlant: "",
-  });
-
-  const [speciesLines, setSpeciesLines] = useState<SpeciesLine[]>([{ species: "", weightKg: 0 }]);
-  const [transportLegs, setTransportLegs] = useState<TransportLeg[]>([]);
-
-  const updateForm = (k: string, v: string) => setForm((p) => ({ ...p, [k]: v }));
-
-  const addSpeciesLine = () => setSpeciesLines((p) => [...p, { species: "", weightKg: 0 }]);
-  const removeSpeciesLine = (i: number) => setSpeciesLines((p) => p.filter((_, idx) => idx !== i));
-  const updateSpeciesLine = (i: number, k: keyof SpeciesLine, v: any) =>
-    setSpeciesLines((p) => p.map((l, idx) => (idx === i ? { ...l, [k]: v } : l)));
-
-  const addTransportLeg = () =>
-    setTransportLegs((p) => [...p, { transportCompany: "", vehicleReg: "", handoverTime: nowISO(), notes: "" }]);
-  const removeTransportLeg = (i: number) => setTransportLegs((p) => p.filter((_, idx) => idx !== i));
-  const updateTransportLeg = (i: number, k: keyof TransportLeg, v: any) =>
-    setTransportLegs((p) => p.map((l, idx) => (idx === i ? { ...l, [k]: v } : l)));
-
-  const submit = async () => {
-    if (!form.fromCompany || !form.toCompany || !form.vesselRef) {
-      addToast("error", "Missing required fields (From, To, Vessel)");
+    if (authError) {
+      setError(authError.message);
+      setLoading(false);
       return;
     }
 
-    const cleanSpecies = speciesLines.filter((l) => l.species && +l.weightKg > 0);
-    if (cleanSpecies.length === 0) {
-      addToast("error", "Add at least one species with weight > 0");
+    if (!authData.user) {
+      setError("Signup failed");
+      setLoading(false);
       return;
     }
 
-    const batch: Batch = {
-      id: uid(),
-      batchType,
-      status: "Created",
-      createdAt: nowISO(),
-      updatedAt: nowISO(),
-      fromCompany: form.fromCompany,
-      toCompany: form.toCompany,
-      vesselRef: form.vesselRef,
-      orderDate: form.orderDate,
-      lotRef: form.lotRef,
-      notes: form.notes,
-      speciesLines: cleanSpecies,
-      transportLegs,
-      landingCertNo: form.landingCertNo,
-      processingCertNo: form.processingCertNo,
-      catchCertNo: form.catchCertNo,
-      healthCertNo: form.healthCertNo,
-      landingPort: form.landingPort,
-      processingPlant: form.processingPlant,
-    };
+    // Create company
+    const { data: company, error: companyError } = await supabase
+      .from("companies")
+      .insert({ name: companyName })
+      .select()
+      .single();
 
-    await createBatch(batch);
-    setView("batches");
-  };
-
-  return (
-    <div>
-      <h1 style={{ fontSize: 24, fontWeight: 900, marginBottom: 18 }}>Create {cap(batchType)} Docket</h1>
-
-      <div style={{ ...S.card, marginBottom: 14 }}>
-        <div style={S.cardPad}>
-          <div style={{ ...S.cardHead }}>
-            <div style={S.cardTitle}>Basic Details</div>
-          </div>
-          <div style={{ display: "grid", gap: 12 }}>
-            <div>
-              <label style={S.label}>From Company</label>
-              <input style={S.input} list="companies" value={form.fromCompany} onChange={(e) => updateForm("fromCompany", e.target.value)} />
-            </div>
-            <div>
-              <label style={S.label}>To Company</label>
-              <input style={S.input} list="companies" value={form.toCompany} onChange={(e) => updateForm("toCompany", e.target.value)} />
-            </div>
-            <div>
-              <label style={S.label}>Vessel / Reference</label>
-              <input style={S.input} value={form.vesselRef} onChange={(e) => updateForm("vesselRef", e.target.value)} />
-            </div>
-            <div>
-              <label style={S.label}>Order Date</label>
-              <input type="date" style={S.input} value={form.orderDate} onChange={(e) => updateForm("orderDate", e.target.value)} />
-            </div>
-            <div>
-              <label style={S.label}>Lot Reference</label>
-              <input style={S.input} value={form.lotRef} onChange={(e) => updateForm("lotRef", e.target.value)} />
-            </div>
-            <div>
-              <label style={S.label}>Landing Port</label>
-              <input style={S.input} value={form.landingPort} onChange={(e) => updateForm("landingPort", e.target.value)} />
-            </div>
-            <div>
-              <label style={S.label}>Processing Plant</label>
-              <input style={S.input} value={form.processingPlant} onChange={(e) => updateForm("processingPlant", e.target.value)} />
-            </div>
-            <div>
-              <label style={S.label}>Notes</label>
-              <textarea
-                style={{ ...S.input, minHeight: 80, resize: "vertical" as const }}
-                value={form.notes}
-                onChange={(e) => updateForm("notes", e.target.value)}
-              />
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div style={{ ...S.card, marginBottom: 14 }}>
-        <div style={S.cardPad}>
-          <div style={{ ...S.cardHead }}>
-            <div style={S.cardTitle}>Certification Numbers</div>
-          </div>
-          <div style={{ display: "grid", gap: 12 }}>
-            <div>
-              <label style={S.label}>Landing Cert No.</label>
-              <input style={S.input} value={form.landingCertNo} onChange={(e) => updateForm("landingCertNo", e.target.value)} />
-            </div>
-            <div>
-              <label style={S.label}>Processing Cert No.</label>
-              <input style={S.input} value={form.processingCertNo} onChange={(e) => updateForm("processingCertNo", e.target.value)} />
-            </div>
-            <div>
-              <label style={S.label}>Catch Cert No.</label>
-              <input style={S.input} value={form.catchCertNo} onChange={(e) => updateForm("catchCertNo", e.target.value)} />
-            </div>
-            <div>
-              <label style={S.label}>Health Cert No.</label>
-              <input style={S.input} value={form.healthCertNo} onChange={(e) => updateForm("healthCertNo", e.target.value)} />
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div style={{ ...S.card, marginBottom: 14 }}>
-        <div style={S.cardPad}>
-          <div style={{ ...S.cardHead }}>
-            <div style={S.cardTitle}>Species & Weight</div>
-            <button style={{ ...S.btn, ...S.btnSecondary }} onClick={addSpeciesLine}>
-              + Add Line
-            </button>
-          </div>
-          {speciesLines.map((l, i) => (
-            <div key={i} style={{ display: "flex", gap: 10, marginBottom: 10 }}>
-              <div style={{ flex: 1 }}>
-                <input
-                  style={S.input}
-                  list="species"
-                  placeholder="Species"
-                  value={l.species}
-                  onChange={(e) => updateSpeciesLine(i, "species", e.target.value)}
-                />
-              </div>
-              <div style={{ width: 140 }}>
-                <input
-                  type="number"
-                  style={S.input}
-                  placeholder="Weight (kg)"
-                  value={l.weightKg || ""}
-                  onChange={(e) => updateSpeciesLine(i, "weightKg", +e.target.value)}
-                />
-              </div>
-              <button style={{ ...S.btn, ...S.btnDanger }} onClick={() => removeSpeciesLine(i)}>
-                Remove
-              </button>
-            </div>
-          ))}
-          <div style={{ marginTop: 12, fontWeight: 900, fontSize: 14 }}>
-            Total: {round2(speciesLines.reduce((a, l) => a + (+l.weightKg || 0), 0))} kg
-          </div>
-        </div>
-      </div>
-
-      <div style={{ ...S.card, marginBottom: 14 }}>
-        <div style={S.cardPad}>
-          <div style={{ ...S.cardHead }}>
-            <div style={S.cardTitle}>Transport / Handover</div>
-            <button style={{ ...S.btn, ...S.btnSecondary }} onClick={addTransportLeg}>
-              + Add Leg
-            </button>
-          </div>
-          {transportLegs.map((leg, i) => (
-            <div key={i} style={{ marginBottom: 14, paddingBottom: 14, borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
-              <div style={{ display: "grid", gap: 10 }}>
-                <div>
-                  <label style={S.label}>Transport Company</label>
-                  <input
-                    style={S.input}
-                    list="companies"
-                    value={leg.transportCompany}
-                    onChange={(e) => updateTransportLeg(i, "transportCompany", e.target.value)}
-                  />
-                </div>
-                <div>
-                  <label style={S.label}>Vehicle Reg</label>
-                  <input
-                    style={S.input}
-                    value={leg.vehicleReg}
-                    onChange={(e) => updateTransportLeg(i, "vehicleReg", e.target.value)}
-                  />
-                </div>
-                <div>
-                  <label style={S.label}>Handover Time</label>
-                  <input
-                    type="datetime-local"
-                    style={S.input}
-                    value={leg.handoverTime?.slice(0, 16) || ""}
-                    onChange={(e) => updateTransportLeg(i, "handoverTime", e.target.value ? new Date(e.target.value).toISOString() : "")}
-                  />
-                </div>
-                <div>
-                  <label style={S.label}>Notes</label>
-                  <input
-                    style={S.input}
-                    value={leg.notes || ""}
-                    onChange={(e) => updateTransportLeg(i, "notes", e.target.value)}
-                  />
-                </div>
-                <button style={{ ...S.btn, ...S.btnDanger }} onClick={() => removeTransportLeg(i)}>
-                  Remove Leg
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div style={{ display: "flex", gap: 12 }}>
-        <button style={{ ...S.btn, ...S.btnPrimary, padding: "12px 14px", fontWeight: 900 }} onClick={submit}>
-          Create Docket
-        </button>
-        <button style={{ ...S.btn, ...S.btnSecondary, padding: "12px 14px" }} onClick={() => setView("dashboard")}>
-          Cancel
-        </button>
-      </div>
-
-      <datalist id="species">
-        {speciesLibrary.map((s) => (
-          <option key={s} value={s} />
-        ))}
-      </datalist>
-      <datalist id="companies">
-        {companyLibrary.map((c) => (
-          <option key={c} value={c} />
-        ))}
-      </datalist>
-    </div>
-  );
-}
-
-// ─── BATCH DETAIL ────────────────────────────────────────────────────────────
-function BatchDetail({
-  batch,
-  updateBatch,
-  deleteBatch,
-  archiveBatch,
-  unarchiveBatch,
-  closeBatch,
-  addToast,
-  speciesLibrary,
-  companyLibrary,
-}: {
-  batch: Batch;
-  updateBatch: (id: string, updates: Partial<Batch>) => Promise<void>;
-  deleteBatch: (id: string) => Promise<void>;
-  archiveBatch: (id: string) => Promise<void>;
-  unarchiveBatch: (id: string) => Promise<void>;
-  closeBatch: () => void;
-  addToast: (type: Toast["type"], message: string) => void;
-  speciesLibrary: string[];
-  companyLibrary: string[];
-}) {
-  const [editing, setEditing] = useState(false);
-  const [form, setForm] = useState({ ...batch });
-
-  const locked = isLocked(batch);
-  const canConfirm = canConfirmShipment(batch);
-
-  const updateForm = (k: string, v: any) => setForm((p) => ({ ...p, [k]: v }));
-
-  const saveEdits = async () => {
-    await updateBatch(batch.id, form);
-    setEditing(false);
-    addToast("success", "Changes saved");
-  };
-
-  const confirmShipment = async () => {
-    await updateBatch(batch.id, { status: "In Transit", sentAt: nowISO(), locked: true });
-    addToast("success", "Shipment confirmed. Batch is now locked.");
-  };
-
-  const qrUrl = `${RESOLVER_BASE}/?receipt=${batch.id}&d=${encodeBatch(batch)}`;
-
-  return (
-    <div>
-      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 18 }}>
-        <button style={{ ...S.btn, ...S.btnSecondary }} onClick={closeBatch}>
-          ← Back
-        </button>
-        <h1 style={{ fontSize: 24, fontWeight: 900 }}>Batch {batch.id}</h1>
-        <div
-          style={{
-            display: "inline-flex",
-            padding: "4px 12px",
-            borderRadius: 999,
-            fontSize: 11,
-            fontWeight: 800,
-            background: batch.batchType === "inbound" ? "rgba(59,130,246,0.15)" : "rgba(249,115,22,0.15)",
-            color: batch.batchType === "inbound" ? "#3B82F6" : "#F97316",
-            border: `1px solid ${batch.batchType === "inbound" ? "#3B82F6" : "#F97316"}44`,
-            marginLeft: "auto",
-          }}
-        >
-          {batch.status}
-        </div>
-      </div>
-
-      {locked && (
-        <div
-          style={{
-            background: "rgba(245,158,11,0.12)",
-            border: "1px solid rgba(245,158,11,0.25)",
-            borderRadius: 12,
-            padding: 12,
-            marginBottom: 14,
-            fontSize: 13,
-          }}
-        >
-          🔒 This batch is <b>locked</b> and cannot be edited (status: {batch.status}).
-        </div>
-      )}
-
-      <div style={{ ...S.card, marginBottom: 14 }}>
-        <div style={S.cardPad}>
-          <div style={S.cardHead}>
-            <div style={S.cardTitle}>Batch Info</div>
-            {!locked && !editing && (
-              <button style={{ ...S.btn, ...S.btnSecondary }} onClick={() => setEditing(true)}>
-                Edit
-              </button>
-            )}
-            {editing && (
-              <div style={{ display: "flex", gap: 8 }}>
-                <button style={{ ...S.btn, ...S.btnPrimary }} onClick={saveEdits}>
-                  Save
-                </button>
-                <button style={{ ...S.btn }} onClick={() => setEditing(false)}>
-                  Cancel
-                </button>
-              </div>
-            )}
-          </div>
-
-          {!editing ? (
-            <div style={{ display: "grid", gap: 10, fontSize: 13 }}>
-              <div>
-                <b>From:</b> {batch.fromCompany}
-              </div>
-              <div>
-                <b>To:</b> {batch.toCompany}
-              </div>
-              <div>
-                <b>Vessel:</b> {batch.vesselRef}
-              </div>
-              <div>
-                <b>Order Date:</b> {fmtDate(batch.orderDate)}
-              </div>
-              <div>
-                <b>Lot Ref:</b> {batch.lotRef || "—"}
-              </div>
-              <div>
-                <b>Landing Port:</b> {batch.landingPort || "—"}
-              </div>
-              <div>
-                <b>Processing Plant:</b> {batch.processingPlant || "—"}
-              </div>
-              <div>
-                <b>Created:</b> {fmtDT(batch.createdAt)}
-              </div>
-              {batch.sentAt && (
-                <div>
-                  <b>Sent:</b> {fmtDT(batch.sentAt)}
-                </div>
-              )}
-              {batch.receivedAt && (
-                <div>
-                  <b>Received:</b> {fmtDT(batch.receivedAt)}
-                </div>
-              )}
-              {batch.notes && (
-                <div>
-                  <b>Notes:</b> {batch.notes}
-                </div>
-              )}
-            </div>
-          ) : (
-            <div style={{ display: "grid", gap: 12 }}>
-              <div>
-                <label style={S.label}>From Company</label>
-                <input style={S.input} list="companies" value={form.fromCompany} onChange={(e) => updateForm("fromCompany", e.target.value)} />
-              </div>
-              <div>
-                <label style={S.label}>To Company</label>
-                <input style={S.input} list="companies" value={form.toCompany} onChange={(e) => updateForm("toCompany", e.target.value)} />
-              </div>
-              <div>
-                <label style={S.label}>Vessel</label>
-                <input style={S.input} value={form.vesselRef} onChange={(e) => updateForm("vesselRef", e.target.value)} />
-              </div>
-              <div>
-                <label style={S.label}>Order Date</label>
-                <input type="date" style={S.input} value={form.orderDate} onChange={(e) => updateForm("orderDate", e.target.value)} />
-              </div>
-              <div>
-                <label style={S.label}>Lot Ref</label>
-                <input style={S.input} value={form.lotRef} onChange={(e) => updateForm("lotRef", e.target.value)} />
-              </div>
-              <div>
-                <label style={S.label}>Landing Port</label>
-                <input style={S.input} value={form.landingPort} onChange={(e) => updateForm("landingPort", e.target.value)} />
-              </div>
-              <div>
-                <label style={S.label}>Processing Plant</label>
-                <input style={S.input} value={form.processingPlant} onChange={(e) => updateForm("processingPlant", e.target.value)} />
-              </div>
-              <div>
-                <label style={S.label}>Notes</label>
-                <textarea style={{ ...S.input, minHeight: 80 }} value={form.notes} onChange={(e) => updateForm("notes", e.target.value)} />
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-
-      <div style={{ ...S.card, marginBottom: 14 }}>
-        <div style={S.cardPad}>
-          <div style={S.cardHead}>
-            <div style={S.cardTitle}>Certification Numbers</div>
-          </div>
-          <div style={{ display: "grid", gap: 10, fontSize: 13 }}>
-            <div>
-              <b>Landing Cert:</b> {batch.landingCertNo || "—"}
-            </div>
-            <div>
-              <b>Processing Cert:</b> {batch.processingCertNo || "—"}
-            </div>
-            <div>
-              <b>Catch Cert:</b> {batch.catchCertNo || "—"}
-            </div>
-            <div>
-              <b>Health Cert:</b> {batch.healthCertNo || "—"}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div style={{ ...S.card, marginBottom: 14 }}>
-        <div style={S.cardPad}>
-          <div style={S.cardHead}>
-            <div style={S.cardTitle}>Species & Weight</div>
-          </div>
-          {(batch.speciesLines || []).map((l, i) => (
-            <div
-              key={i}
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                padding: "8px 12px",
-                background: "rgba(255,255,255,0.02)",
-                border: "1px solid rgba(255,255,255,0.06)",
-                borderRadius: 9,
-                marginBottom: 6,
-                fontSize: 13,
-              }}
-            >
-              <span style={{ fontWeight: 700 }}>{l.species}</span>
-              <span style={{ fontFamily: "monospace", color: "#F97316" }}>{(+l.weightKg).toFixed(2)} kg</span>
-            </div>
-          ))}
-          <div style={{ marginTop: 12, fontWeight: 900, fontSize: 14 }}>Total: {totalKg(batch)} kg</div>
-        </div>
-      </div>
-
-      {(batch.transportLegs || []).length > 0 && (
-        <div style={{ ...S.card, marginBottom: 14 }}>
-          <div style={S.cardPad}>
-            <div style={S.cardHead}>
-              <div style={S.cardTitle}>Transport / Handover</div>
-            </div>
-            {batch.transportLegs.map((leg, i) => (
-              <div
-                key={i}
-                style={{
-                  paddingBottom: 12,
-                  marginBottom: 12,
-                  borderBottom: "1px solid rgba(255,255,255,0.06)",
-                }}
-              >
-                <div style={{ display: "grid", gap: 6, fontSize: 13 }}>
-                  <div>
-                    <b>Company:</b> {leg.transportCompany}
-                  </div>
-                  <div>
-                    <b>Vehicle:</b> {leg.vehicleReg}
-                  </div>
-                  <div>
-                    <b>Handover:</b> {fmtDT(leg.handoverTime)}
-                  </div>
-                  {leg.notes && (
-                    <div>
-                      <b>Notes:</b> {leg.notes}
-                    </div>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {canConfirm && (
-        <div style={{ ...S.card, marginBottom: 14 }}>
-          <div style={S.cardPad}>
-            <div style={S.cardHead}>
-              <div style={S.cardTitle}>Confirm Shipment</div>
-            </div>
-            <button style={{ ...S.btn, ...S.btnPrimary, padding: "12px 14px", fontWeight: 900 }} onClick={confirmShipment}>
-              Confirm Shipment (Lock & Send)
-            </button>
-            <div style={{ fontSize: 12, opacity: 0.6, marginTop: 8 }}>
-              This will mark the batch as "In Transit" and lock it. Generate the QR code for the recipient.
-            </div>
-          </div>
-        </div>
-      )}
-
-      {batch.status === "In Transit" && (
-        <div style={{ ...S.card, marginBottom: 14 }}>
-          <div style={S.cardPad}>
-            <div style={S.cardHead}>
-              <div style={S.cardTitle}>Receipt QR Code</div>
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
-              <QRCodeSVG value={qrUrl} size={180} />
-              <div style={{ fontSize: 12, opacity: 0.6, textAlign: "center" }}>
-                Recipient scans this QR to confirm receipt. Or share this link:
-              </div>
-              <a
-                href={qrUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                style={{ fontSize: 12, color: "#F97316", fontWeight: 800, wordBreak: "break-all" }}
-              >
-                {qrUrl}
-              </a>
-            </div>
-          </div>
-        </div>
-      )}
-
-      <div style={{ display: "flex", gap: 12, marginTop: 18 }}>
-        {batch.archived ? (
-          <button style={{ ...S.btn, ...S.btnOk }} onClick={() => unarchiveBatch(batch.id)}>
-            Unarchive
-          </button>
-        ) : (
-          <button style={{ ...S.btn, ...S.btnSecondary }} onClick={() => archiveBatch(batch.id)}>
-            Archive
-          </button>
-        )}
-        {!locked && (
-          <button style={{ ...S.btn, ...S.btnDanger }} onClick={() => deleteBatch(batch.id)}>
-            Delete
-          </button>
-        )}
-      </div>
-
-      <datalist id="species">
-        {speciesLibrary.map((s) => (
-          <option key={s} value={s} />
-        ))}
-      </datalist>
-      <datalist id="companies">
-        {companyLibrary.map((c) => (
-          <option key={c} value={c} />
-        ))}
-      </datalist>
-    </div>
-  );
-}
-
-// ─── OUTBOUND SENT VIEW ──────────────────────────────────────────────────────
-function OutboundSentView({ batches, openBatch }: { batches: Batch[]; openBatch: (id: string) => void }) {
-  const outbound = useMemo(
-    () => batches.filter((b) => b.batchType === "outbound" && !b.archived && b.status !== "Completed"),
-    [batches]
-  );
-
-  return (
-    <div>
-      <h1 style={{ fontSize: 24, fontWeight: 900, marginBottom: 18 }}>Outbound Batches</h1>
-
-      {outbound.length === 0 && (
-        <div style={{ padding: 32, textAlign: "center", opacity: 0.6 }}>No outbound batches</div>
-      )}
-
-      <div style={{ display: "grid", gap: 12 }}>
-        {outbound.map((b) => (
-          <div key={b.id} style={S.card}>
-            <div style={S.cardPad}>
-              <div style={S.cardHead}>
-                <div>
-                  <div style={{ fontSize: 14, fontWeight: 900, marginBottom: 4 }}>{b.id}</div>
-                  <div style={{ fontSize: 12, opacity: 0.6 }}>{fmtDate(b.createdAt)}</div>
-                </div>
-                <div
-                  style={{
-                    display: "inline-flex",
-                    padding: "4px 12px",
-                    borderRadius: 999,
-                    fontSize: 11,
-                    fontWeight: 800,
-                    background: "rgba(249,115,22,0.15)",
-                    color: "#F97316",
-                    border: "1px solid #F9731644",
-                  }}
-                >
-                  {b.status}
-                </div>
-              </div>
-
-              <div style={{ marginTop: 12, fontSize: 13, opacity: 0.8 }}>
-                <div>
-                  <b>To:</b> {b.toCompany}
-                </div>
-                <div>
-                  <b>Species:</b> {speciesSummary(b)} · <b>{totalKg(b)} kg</b>
-                </div>
-              </div>
-
-              <button style={{ ...S.btn, ...S.btnSecondary, marginTop: 12 }} onClick={() => openBatch(b.id)}>
-                View Batch
-              </button>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ─── EOW VIEW ────────────────────────────────────────────────────────────────
-function EOWView({ batches, openBatch }: { batches: Batch[]; openBatch: (id: string) => void }) {
-  return (
-    <div>
-      <h1 style={{ fontSize: 24, fontWeight: 900, marginBottom: 18 }}>End of Week (Completed Batches)</h1>
-
-      {batches.length === 0 && (
-        <div style={{ padding: 32, textAlign: "center", opacity: 0.6 }}>No completed batches</div>
-      )}
-
-      <div style={{ display: "grid", gap: 12 }}>
-        {batches.map((b) => (
-          <div key={b.id} style={S.card}>
-            <div style={S.cardPad}>
-              <div style={S.cardHead}>
-                <div>
-                  <div style={{ fontSize: 14, fontWeight: 900, marginBottom: 4 }}>{b.id}</div>
-                  <div style={{ fontSize: 12, opacity: 0.6 }}>
-                    {cap(b.batchType)} · Completed {fmtDate(b.receivedAt || b.updatedAt)}
-                  </div>
-                </div>
-                <div
-                  style={{
-                    display: "inline-flex",
-                    padding: "4px 12px",
-                    borderRadius: 999,
-                    fontSize: 11,
-                    fontWeight: 800,
-                    background: "rgba(34,197,94,0.15)",
-                    color: "#22C55E",
-                    border: "1px solid #22C55E44",
-                  }}
-                >
-                  Completed
-                </div>
-              </div>
-
-              <div style={{ marginTop: 12, fontSize: 13, opacity: 0.8 }}>
-                <div>
-                  <b>From:</b> {b.fromCompany}
-                </div>
-                <div>
-                  <b>To:</b> {b.toCompany}
-                </div>
-                <div>
-                  <b>Species:</b> {speciesSummary(b)} · <b>{totalKg(b)} kg</b>
-                </div>
-              </div>
-
-              <button style={{ ...S.btn, ...S.btnSecondary, marginTop: 12 }} onClick={() => openBatch(b.id)}>
-                View
-              </button>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ─── ARCHIVE VIEW ────────────────────────────────────────────────────────────
-function ArchiveView({
-  batches,
-  openBatch,
-  unarchiveBatch,
-}: {
-  batches: Batch[];
-  openBatch: (id: string) => void;
-  unarchiveBatch: (id: string) => Promise<void>;
-}) {
-  return (
-    <div>
-      <h1 style={{ fontSize: 24, fontWeight: 900, marginBottom: 18 }}>Archived Batches</h1>
-
-      {batches.length === 0 && (
-        <div style={{ padding: 32, textAlign: "center", opacity: 0.6 }}>No archived batches</div>
-      )}
-
-      <div style={{ display: "grid", gap: 12 }}>
-        {batches.map((b) => (
-          <div key={b.id} style={S.card}>
-            <div style={S.cardPad}>
-              <div style={S.cardHead}>
-                <div>
-                  <div style={{ fontSize: 14, fontWeight: 900, marginBottom: 4 }}>{b.id}</div>
-                  <div style={{ fontSize: 12, opacity: 0.6 }}>
-                    {cap(b.batchType)} · {fmtDate(b.createdAt)}
-                  </div>
-                </div>
-                <div
-                  style={{
-                    display: "inline-flex",
-                    padding: "4px 12px",
-                    borderRadius: 999,
-                    fontSize: 11,
-                    fontWeight: 800,
-                    background: "rgba(156,163,175,0.15)",
-                    color: "#9CA3AF",
-                    border: "1px solid #9CA3AF44",
-                  }}
-                >
-                  Archived
-                </div>
-              </div>
-
-              <div style={{ marginTop: 12, fontSize: 13, opacity: 0.8 }}>
-                <div>
-                  <b>From:</b> {b.fromCompany}
-                </div>
-                <div>
-                  <b>To:</b> {b.toCompany}
-                </div>
-                <div>
-                  <b>Species:</b> {speciesSummary(b)} · <b>{totalKg(b)} kg</b>
-                </div>
-              </div>
-
-              <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-                <button style={{ ...S.btn, ...S.btnSecondary }} onClick={() => openBatch(b.id)}>
-                  View
-                </button>
-                {b.status !== "Completed" && !isLocked(b) && (
-                  <button style={{ ...S.btn, ...S.btnOk }} onClick={() => unarchiveBatch(b.id)}>
-                    Unarchive
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ─── LIBRARY VIEW ────────────────────────────────────────────────────────────
-function LibraryView({
-  title,
-  items,
-  setItems,
-  addToast,
-}: {
-  title: string;
-  items: string[];
-  setItems: (items: string[]) => void;
-  addToast: (type: Toast["type"], message: string) => void;
-}) {
-  const [newItem, setNewItem] = useState("");
-
-  const add = () => {
-    if (!newItem.trim()) return;
-    if (items.includes(newItem.trim())) {
-      addToast("error", "Already exists");
+    if (companyError) {
+      setError(companyError.message);
+      setLoading(false);
       return;
     }
-    setItems([...items, newItem.trim()]);
-    setNewItem("");
-    addToast("success", "Added");
+
+    // Create membership
+    const { error: memberError } = await supabase.from("company_memberships").insert({
+      user_id: authData.user.id,
+      company_id: company.id,
+      role: "admin",
+    });
+
+    if (memberError) {
+      setError(memberError.message);
+      setLoading(false);
+      return;
+    }
+
+    onAuth();
+    setLoading(false);
   };
 
-  const remove = (item: string) => {
-    setItems(items.filter((i) => i !== item));
-    addToast("info", "Removed");
+  const handleInvite = async () => {
+    if (!supabase) {
+      setError("Supabase is not configured.");
+      return;
+    }
+    setLoading(true);
+    setError("");
+
+    const { data: authData, error: authError } = await supabase.auth.signUp({
+      email,
+      password,
+      options: { data: { full_name: fullName } },
+    });
+
+    if (authError) {
+      setError(authError.message);
+      setLoading(false);
+      return;
+    }
+
+    if (!authData.user) {
+      setError("Signup failed");
+      setLoading(false);
+      return;
+    }
+
+    const { error: memberError } = await supabase.from("company_memberships").insert({
+      user_id: authData.user.id,
+      company_id: inviteCode,
+      role: "member",
+    });
+
+    if (memberError) {
+      setError(memberError.message);
+      setLoading(false);
+      return;
+    }
+
+    onAuth();
+    setLoading(false);
+  };
+
+  const S = {
+    screen: {
+      minHeight: "100vh",
+      background: "#080D14",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      padding: 20,
+    },
+    card: {
+      maxWidth: 440,
+      width: "100%",
+      background: "rgba(255,255,255,0.03)",
+      border: "1px solid rgba(255,255,255,0.07)",
+      borderRadius: 16,
+      padding: 32,
+    },
+    logo: { height: 56, marginBottom: 24, borderRadius: 10 },
+    h1: { fontSize: 24, fontWeight: 900, color: "#E8EDF5", marginBottom: 8 },
+    p: { fontSize: 14, color: "rgba(232,237,245,0.6)", marginBottom: 24 },
+    input: {
+      width: "100%",
+      background: "rgba(15,23,42,0.6)",
+      border: "1px solid rgba(255,255,255,0.08)",
+      color: "#E8EDF5",
+      borderRadius: 10,
+      padding: "11px 14px",
+      fontSize: 14,
+      marginBottom: 12,
+      boxSizing: "border-box" as const,
+    },
+    btn: {
+      width: "100%",
+      background: "rgba(249,115,22,0.2)",
+      border: "1px solid rgba(249,115,22,0.4)",
+      color: "#F97316",
+      borderRadius: 10,
+      padding: "12px",
+      fontSize: 14,
+      fontWeight: 700,
+      cursor: "pointer",
+      marginBottom: 12,
+    },
+    error: {
+      background: "rgba(239,68,68,0.15)",
+      border: "1px solid rgba(239,68,68,0.3)",
+      color: "#EF4444",
+      padding: "10px 14px",
+      borderRadius: 8,
+      fontSize: 13,
+      marginBottom: 12,
+    },
+    tabs: { display: "flex", gap: 8, marginBottom: 20 },
+    tab: {
+      flex: 1,
+      padding: "8px",
+      background: "rgba(255,255,255,0.02)",
+      border: "1px solid rgba(255,255,255,0.06)",
+      borderRadius: 8,
+      fontSize: 13,
+      fontWeight: 600,
+      color: "#E8EDF5",
+      cursor: "pointer",
+    },
+    tabActive: {
+      background: "rgba(249,115,22,0.12)",
+      borderColor: "rgba(249,115,22,0.5)",
+      color: "#F97316",
+    },
   };
 
   return (
-    <div>
-      <h1 style={{ fontSize: 24, fontWeight: 900, marginBottom: 18 }}>{title}</h1>
-
-      <div style={{ ...S.card, marginBottom: 14 }}>
-        <div style={S.cardPad}>
-          <div style={{ display: "flex", gap: 10 }}>
-            <input style={{ ...S.input, flex: 1 }} value={newItem} onChange={(e) => setNewItem(e.target.value)} placeholder="Add new..." />
-            <button style={{ ...S.btn, ...S.btnPrimary }} onClick={add}>
-              Add
-            </button>
-          </div>
-        </div>
-      </div>
-
-      <div style={{ display: "grid", gap: 10 }}>
-        {items.map((item) => (
-          <div key={item} style={S.card}>
-            <div style={{ ...S.cardPad, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <div style={{ fontSize: 14, fontWeight: 700 }}>{item}</div>
-              <button style={{ ...S.btn, ...S.btnDanger }} onClick={() => remove(item)}>
-                Remove
-              </button>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ─── SETTINGS VIEW ───────────────────────────────────────────────────────────
-function SettingsView({ addToast }: { addToast: (type: Toast["type"], message: string) => void }) {
-  const [ourCompany, setOurCompany] = useState(() => lsGet(OUR_COMPANY_KEY) || "");
-
-  const save = () => {
-    lsSet(OUR_COMPANY_KEY, ourCompany);
-    addToast("success", "Settings saved");
-  };
-
-  return (
-    <div>
-      <h1 style={{ fontSize: 24, fontWeight: 900, marginBottom: 18 }}>Settings</h1>
-
+    <div style={S.screen}>
       <div style={S.card}>
-        <div style={S.cardPad}>
-          <div style={S.cardHead}>
-            <div style={S.cardTitle}>Company Info</div>
-          </div>
-          <div style={{ display: "grid", gap: 12 }}>
-            <div>
-              <label style={S.label}>Your Company Name</label>
-              <input style={S.input} value={ourCompany} onChange={(e) => setOurCompany(e.target.value)} />
-            </div>
-            <button style={{ ...S.btn, ...S.btnPrimary }} onClick={save}>
-              Save
-            </button>
-          </div>
+        <img src={LOGO_URL} alt="Batch ID Pro" style={S.logo} />
+        <h1 style={S.h1}>{APP_NAME}</h1>
+        <p style={S.p}>Sign in to your company account</p>
+
+        <div style={S.tabs}>
+          <button style={{ ...S.tab, ...(mode === "signin" ? S.tabActive : {}) }} onClick={() => setMode("signin")}>
+            Sign In
+          </button>
+          <button style={{ ...S.tab, ...(mode === "signup" ? S.tabActive : {}) }} onClick={() => setMode("signup")}>
+            New Company
+          </button>
+          <button style={{ ...S.tab, ...(mode === "invite" ? S.tabActive : {}) }} onClick={() => setMode("invite")}>
+            Join Company
+          </button>
         </div>
+
+        {error && <div style={S.error}>{error}</div>}
+
+        {mode === "signin" && (
+          <>
+            <input type="email" placeholder="Email" style={S.input} value={email} onChange={(e) => setEmail(e.target.value)} />
+            <input
+              type="password"
+              placeholder="Password"
+              style={S.input}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handleSignIn()}
+            />
+            <button style={S.btn} onClick={handleSignIn} disabled={loading}>
+              {loading ? "Signing in..." : "Sign In"}
+            </button>
+          </>
+        )}
+
+        {mode === "signup" && (
+          <>
+            <input type="text" placeholder="Your Full Name" style={S.input} value={fullName} onChange={(e) => setFullName(e.target.value)} />
+            <input type="text" placeholder="Company Name" style={S.input} value={companyName} onChange={(e) => setCompanyName(e.target.value)} />
+            <input type="email" placeholder="Email" style={S.input} value={email} onChange={(e) => setEmail(e.target.value)} />
+            <input
+              type="password"
+              placeholder="Password (min 6 characters)"
+              style={S.input}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+            <button style={S.btn} onClick={handleSignUp} disabled={loading}>
+              {loading ? "Creating account..." : "Create Company Account"}
+            </button>
+          </>
+        )}
+
+        {mode === "invite" && (
+          <>
+            <input type="text" placeholder="Your Full Name" style={S.input} value={fullName} onChange={(e) => setFullName(e.target.value)} />
+            <input type="email" placeholder="Email" style={S.input} value={email} onChange={(e) => setEmail(e.target.value)} />
+            <input
+              type="password"
+              placeholder="Password (min 6 characters)"
+              style={S.input}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+            <input
+              type="text"
+              placeholder="Company ID (from invite)"
+              style={S.input}
+              value={inviteCode}
+              onChange={(e) => setInviteCode(e.target.value)}
+            />
+            <button style={S.btn} onClick={handleInvite} disabled={loading}>
+              {loading ? "Joining..." : "Join Company"}
+            </button>
+          </>
+        )}
       </div>
     </div>
   );
 }
 
-// ─── MAIN APP ────────────────────────────────────────────────────────────────
+function CompanySelector({
+  companies,
+  onSelect,
+}: {
+  companies: { id: string; name: string }[];
+  onSelect: (companyId: string) => void;
+}) {
+  const S = {
+    screen: { minHeight: "100vh", display: "grid", placeItems: "center", background: "#080D14", color: "#E8EDF5", padding: 20 },
+    card: {
+      width: "min(520px, 92vw)",
+      background: "rgba(255,255,255,0.03)",
+      border: "1px solid rgba(255,255,255,0.07)",
+      borderRadius: 16,
+      padding: 28,
+    },
+    h1: { fontSize: 20, fontWeight: 900, marginBottom: 14 },
+    btn: {
+      width: "100%",
+      textAlign: "left" as const,
+      background: "rgba(255,255,255,0.03)",
+      border: "1px solid rgba(255,255,255,0.08)",
+      borderRadius: 12,
+      padding: "12px 14px",
+      color: "#E8EDF5",
+      cursor: "pointer",
+      marginBottom: 10,
+      fontWeight: 700,
+    },
+    sub: { opacity: 0.7, fontSize: 12, marginTop: 6 },
+  };
+
+  return (
+    <div style={S.screen}>
+      <div style={S.card}>
+        <h1 style={S.h1}>Select a company</h1>
+        <div style={S.sub}>You belong to {companies.length} companies.</div>
+        <div style={{ height: 14 }} />
+        {companies.map((c) => (
+          <button key={c.id} style={S.btn} onClick={() => onSelect(c.id)}>
+            {c.name}
+            <div style={{ opacity: 0.6, fontSize: 12, marginTop: 4 }}>{c.id}</div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+
 export default function App() {
+  // ── Receipt route detection ──
+  // QR codes encode: https://batch.coresystemsni.com/?receipt=ID&d=ENCODED
+  // If ?receipt= is present, render receipt page (external docket).
   if (typeof window !== "undefined") {
     const params = new URLSearchParams(window.location.search);
     const receiptId = params.get("receipt");
@@ -1992,45 +1104,116 @@ export default function App() {
   }
 
   const [session, setSession] = useState<Session | null>(null);
+  const [user, setUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState<boolean>(!!supabase);
+  const [companies, setCompanies] = useState<any[]>([]);
+  const [selectedCompanyId, setSelectedCompanyId] = useState<string | null>(null);
 
+  // Supabase auth listener
   useEffect(() => {
-    if (!supabase) return;
-    let mounted = true;
+    if (!supabase) {
+      setAuthLoading(false);
+      return;
+    }
 
-    (async () => {
-      const { data } = await supabase.auth.getSession();
-      if (mounted) setSession(data.session ?? null);
-    })();
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session ?? null);
+      setUser(session?.user ?? null);
+      setAuthLoading(false);
+    });
 
-    const { data: sub } = supabase.auth.onAuthStateChange((_evt, sess) => {
+    const { data } = supabase.auth.onAuthStateChange((_evt, sess) => {
       setSession(sess ?? null);
+      setUser(sess?.user ?? null);
     });
 
     return () => {
-      mounted = false;
-      sub.subscription.unsubscribe();
+      data.subscription.unsubscribe();
     };
   }, []);
 
-  if (supabase && !session) {
-    return <AuthGate onAuthed={(s) => setSession(s)} />;
+  // Load user's companies
+  useEffect(() => {
+    if (!supabase) return;
+    if (!user) {
+      setCompanies([]);
+      setSelectedCompanyId(null);
+      return;
+    }
+
+    (async () => {
+      const { data: memberships, error } = await supabase
+        .from("company_memberships")
+        .select("company_id, companies(id, name)")
+        .eq("user_id", user.id);
+
+      if (error) {
+        console.error("Error loading memberships:", error);
+        setCompanies([]);
+        setSelectedCompanyId(null);
+        return;
+      }
+
+      const companyList = (memberships || [])
+        .map((m: any) => m.companies)
+        .filter(Boolean);
+
+      setCompanies(companyList);
+
+      if (companyList.length === 1) setSelectedCompanyId(companyList[0].id);
+    })();
+  }, [user]);
+
+  if (authLoading) {
+    return (
+      <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#080D14", color: "white" }}>
+        Loading...
+      </div>
+    );
   }
 
+  if (supabase && !user) {
+    return <AuthScreen onAuth={() => window.location.reload()} />;
+  }
+
+  if (supabase && companies.length > 1 && !selectedCompanyId) {
+    return <CompanySelector companies={companies} onSelect={setSelectedCompanyId} />;
+  }
+
+  if (supabase && !selectedCompanyId) {
+    return (
+      <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#080D14", color: "white" }}>
+        <div>No companies found. Contact your administrator.</div>
+      </div>
+    );
+  }
+
+  // Local fallback "session" (only when Supabase is not configured)
   const [localSession, setLocalSession] = useState(() => lsGet(LOCAL_SESSION_KEY) || "ok");
   useEffect(() => {
     if (!supabase) lsSet(LOCAL_SESSION_KEY, localSession || "ok");
   }, [localSession]);
 
+  const activeCompanyId = supabase ? (selectedCompanyId as string) : "local";
+
   const [view, setView] = useState<View>("dashboard");
   const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
 
-  const [batches, setBatches] = useState<Batch[]>(() => loadBatches());
-  const [speciesLibrary, setSpeciesLibrary] = useState<string[]>(() => lsJson(SPECIES_KEY, DEFAULT_SPECIES));
+  const [batches, setBatches] = useState<Batch[]>(() => (supabase ? [] : loadBatchesLocal()));
+    // Load batches for active company (Supabase mode)
+  useEffect(() => {
+    if (!supabase) return;
+    if (!activeCompanyId) return;
+    loadBatches(activeCompanyId).then(setBatches);
+  }, [activeCompanyId]);
+
+const [speciesLibrary, setSpeciesLibrary] = useState<string[]>(() => lsJson(SPECIES_KEY, DEFAULT_SPECIES));
   const [companyLibrary, setCompanyLibrary] = useState<string[]>(() => lsJson(COMPANY_KEY, DEFAULT_COMPANIES));
 
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [batchTab, setBatchTab] = useState<BatchStatus>("Created");
 
+  // Persist local batches
   useEffect(() => {
     saveBatches(batches);
   }, [batches]);
@@ -2049,6 +1232,7 @@ export default function App() {
     setTimeout(() => setToasts((p) => p.filter((t) => t.id !== id)), 3200);
   }, []);
 
+  // Optional: Pull latest from Supabase at startup (keeps local in sync)
   useEffect(() => {
     if (!supabase || !session) return;
     let mounted = true;
@@ -2074,31 +1258,51 @@ export default function App() {
 
   const createBatch = useCallback(
     async (b: Batch) => {
+      // Supabase-first
+      if (supabase) {
+        const now = new Date().toISOString();
+        const toSave: Batch = { ...b, createdAt: b.createdAt || now, updatedAt: now };
+        const r = await sbUpsertBatch(activeCompanyId, toSave);
+        if (!r.ok) {
+          addToast("error", r.error || "Supabase save failed");
+          return;
+        }
+        addToast("success", "Docket created");
+        const fresh = await loadBatches(activeCompanyId);
+        setBatches(fresh);
+        return;
+      }
+
+      // Local fallback
       setBatches((p) => [b, ...p]);
       addToast("success", "Docket created");
-
-      if (supabase && session) {
-        const r = await sbUpsertBatch(b);
-        if (!r.ok) addToast("error", `Supabase save failed: ${r.error}`);
-      }
     },
-    [addToast, session]
+    [addToast, activeCompanyId]
   );
 
   const updateBatch = useCallback(
     async (id: string, updates: Partial<Batch>) => {
-      setBatches((p) => p.map((b) => (b.id === id ? { ...b, ...updates, updatedAt: nowISO() } : b)));
-
-      if (supabase && session) {
+      // Supabase-first
+      if (supabase) {
         const current = batches.find((x) => x.id === id);
         const merged = current ? ({ ...current, ...updates, updatedAt: nowISO() } as Batch) : null;
-        if (merged) {
-          const r = await sbUpsertBatch(merged);
-          if (!r.ok) addToast("error", `Supabase update failed: ${r.error}`);
+        if (!merged) return;
+
+        const r = await sbUpsertBatch(activeCompanyId, merged);
+        if (!r.ok) {
+          addToast("error", r.error || "Supabase update failed");
+          return;
         }
+
+        const fresh = await loadBatches(activeCompanyId);
+        setBatches(fresh);
+        return;
       }
+
+      // Local fallback
+      setBatches((p) => p.map((b) => (b.id === id ? { ...b, ...updates, updatedAt: nowISO() } : b)));
     },
-    [session, addToast, batches]
+    [addToast, batches, activeCompanyId]
   );
 
   const deleteBatch = useCallback(
@@ -2109,16 +1313,26 @@ export default function App() {
         return;
       }
 
+      // Supabase-first
+      if (supabase) {
+        const { error } = await supabase.from("batches").delete().eq("id", id).eq("company_id", activeCompanyId);
+        if (error) {
+          addToast("error", error.message);
+          return;
+        }
+        addToast("info", "Deleted");
+        const fresh = await loadBatches(activeCompanyId);
+        setBatches(fresh);
+        setView("batches");
+        return;
+      }
+
+      // Local fallback
       setBatches((p) => p.filter((x) => x.id !== id));
       setView("batches");
       addToast("info", "Deleted");
-
-      if (supabase && session) {
-        const { error } = await supabase.from("batches").delete().eq("id", id);
-        if (error) addToast("error", `Supabase delete failed: ${error.message}`);
-      }
     },
-    [addToast, batches, session]
+    [addToast, batches, activeCompanyId]
   );
 
   const archiveBatch = useCallback(
@@ -2161,6 +1375,7 @@ export default function App() {
     setView("batches");
   }, []);
 
+  // Tabs and filters
   const activeBatches = useMemo(
     () => batches.filter((b) => !b.archived && (b.status === "Created" || b.status === "In Transit")),
     [batches]
@@ -2188,6 +1403,7 @@ export default function App() {
     [activeBatches, completedBatches, archivedBatches]
   );
 
+  // LOGOUT
   const doLogout = useCallback(async () => {
     setSelectedBatchId(null);
     setView("dashboard");
@@ -2197,6 +1413,7 @@ export default function App() {
       return;
     }
 
+    // local-only logout just resets “session”
     lsDel(LOCAL_SESSION_KEY);
     setLocalSession("ok");
     addToast("info", "Logged out");
@@ -2250,3 +1467,991 @@ export default function App() {
     </div>
   );
 }
+
+// ─── TOAST ────────────────────────────────────────────────────────────────────
+
+
+function ToastBar({ toasts }: { toasts: Toast[] }) {
+  return (
+    <div style={{ position: "fixed", bottom: 16, right: 16, zIndex: 1000, display: "flex", flexDirection: "column", gap: 8 }}>
+      {toasts.map((t) => (
+        <div
+          key={t.id}
+          style={{
+            padding: "10px 16px",
+            borderRadius: 12,
+            fontSize: 13,
+            fontWeight: 700,
+            backdropFilter: "blur(8px)",
+            border: "1px solid rgba(255,255,255,0.1)",
+            background: t.type === "success" ? "rgba(34,197,94,0.2)" : t.type === "error" ? "rgba(239,68,68,0.2)" : "rgba(59,130,246,0.2)",
+          }}
+        >
+          {t.message}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── HEADER ───────────────────────────────────────────────────────────────────
+function Header({ view, setView, closeBatch, stats, onLogout, showLogout }: any) {
+  const nav = (v: View) => {
+    closeBatch();
+    setView(v);
+  };
+  return (
+    <div style={S.header}>
+      <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+        <img src={LOGO_URL} alt={APP_NAME} style={{ height: 52, borderRadius: 10, objectFit: "contain" }} />
+      </div>
+
+      <nav style={{ display: "flex", gap: 6, flexWrap: "wrap" as const, alignItems: "center" }}>
+        {(
+          [
+            ["dashboard", "Dashboard"],
+            ["batches", `Batches (${stats.total})`],
+            ["inbound", "Create Inbound"],
+            ["outbound", "Outbound (Sent)"],
+            ["eow", `EOW (${stats.completed})`],
+            ["archive", `Archive (${stats.archived})`],
+            ["species", "Species"],
+            ["companies", "Companies"],
+            ["settings", "Settings"],
+          ] as [View, string][]
+        ).map(([v, label]) => (
+          <button key={v} style={{ ...S.navBtn, ...(view === v ? S.navBtnActive : {}) }} onClick={() => nav(v)}>
+            {label}
+          </button>
+        ))}
+
+        {showLogout && (
+          <button style={{ ...S.navBtn, ...S.navBtnActive, marginLeft: 6 }} onClick={onLogout}>
+            Logout
+          </button>
+        )}
+      </nav>
+    </div>
+  );
+}
+
+// ─── DASHBOARD ────────────────────────────────────────────────────────────────
+function Dashboard({ stats, setView }: any) {
+  return (
+    <div>
+      <h2 style={{ fontSize: 20, fontWeight: 900, marginBottom: 20 }}>Dashboard</h2>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12, marginBottom: 24 }}>
+        {[
+          ["Active Batches", stats.total],
+          ["Inbound", stats.inbound],
+          ["Outbound", stats.outbound],
+          ["Completed (EOW)", stats.completed],
+        ].map(([label, val]) => (
+          <div key={label as string} style={S.tile}>
+            <div style={S.tileLabel}>{label}</div>
+            <div style={S.tileValue}>{val}</div>
+          </div>
+        ))}
+      </div>
+      <h3 style={{ fontSize: 14, fontWeight: 800, marginBottom: 12, opacity: 0.7 }}>Quick Actions</h3>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 }}>
+        {(
+          [
+            ["inbound", "📥", "Create Inbound", "New incoming docket"],
+            ["outbound", "📤", "Outbound (Sent)", "What you've shipped"],
+            ["batches", "📋", "All Batches", "View draft + in transit"],
+            ["eow", "📊", "End of Week", "Weekly reports"],
+          ] as [View, string, string, string][]
+        ).map(([v, icon, title, sub]) => (
+          <button key={v} style={S.actionTile} onClick={() => setView(v)}>
+            <div style={{ fontSize: 28, marginBottom: 8 }}>{icon}</div>
+            <div style={{ fontWeight: 800, fontSize: 13 }}>{title}</div>
+            <div style={{ fontSize: 11, opacity: 0.6, marginTop: 4 }}>{sub}</div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── BATCHES VIEW (Created/In Transit) ───────────────────────────────────────
+function BatchesView({ batches, tab, setTab, openBatch, deleteBatch }: any) {
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+        <h2 style={{ fontSize: 20, fontWeight: 900 }}>Batches</h2>
+        <div style={{ display: "flex", gap: 8 }}>
+          {(["Created", "In Transit"] as BatchStatus[]).map((t) => (
+            <button key={t} style={{ ...S.tabBtn, ...(tab === t ? S.tabBtnActive : {}) }} onClick={() => setTab(t)}>
+              {t}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {batches.length === 0 ? (
+        <div style={{ ...S.card, padding: 24, textAlign: "center" as const, opacity: 0.55 }}>No batches in this status</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column" as const, gap: 10 }}>
+          {batches.map((b: Batch) => (
+            <div
+              key={b.id}
+              style={{ ...S.card, ...S.cardPad, display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
+              onClick={() => openBatch(b.id)}
+            >
+              <div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 4 }}>
+                  <span style={{ ...S.typeBadge(b.batchType) }}>{cap(b.batchType)}</span>
+                  <span style={{ ...S.statusBadge(b.status) }}>{b.status}</span>
+                  {!!b.locked && <span style={{ ...S.statusBadge("In Transit" as any) }}>Locked</span>}
+                  <span style={{ fontSize: 11, fontFamily: "monospace", opacity: 0.5 }}>{b.id}</span>
+                </div>
+                <div style={{ fontSize: 14, fontWeight: 700 }}>
+                  {b.fromCompany} → {b.toCompany}
+                </div>
+                <div style={{ fontSize: 12, opacity: 0.6, marginTop: 2 }}>
+                  {speciesSummary(b)} · {totalKg(b)} kg · {fmtDate(b.orderDate)}
+                </div>
+              </div>
+
+              <button
+                style={{ ...S.btn, ...S.btnDanger, fontSize: 11, padding: "4px 10px" }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  deleteBatch(b.id);
+                }}
+                disabled={isLocked(b)}
+                title={isLocked(b) ? "Locked batches cannot be deleted" : "Delete"}
+              >
+                Delete
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── OUTBOUND SENT VIEW ───────────────────────────────────────────────────────
+function OutboundSentView({ batches, openBatch }: any) {
+  const outbound = (batches as Batch[]).filter((b) => b.batchType === "outbound" && !b.archived);
+  const sent = outbound.filter((b) => b.status === "In Transit" || b.status === "Completed");
+
+  return (
+    <div>
+      <h2 style={{ fontSize: 20, fontWeight: 900, marginBottom: 6 }}>Outbound (Sent)</h2>
+      <p style={{ ...S.small, opacity: 0.6, marginBottom: 18 }}>
+        Only batches that have been confirmed as sent. Draft outbound dockets stay under <b>Batches → Created</b>.
+      </p>
+
+      {sent.length === 0 ? (
+        <div style={{ ...S.card, padding: 24, textAlign: "center" as const, opacity: 0.55 }}>No outbound shipments yet</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column" as const, gap: 10 }}>
+          {sent.map((b: Batch) => (
+            <div key={b.id} style={{ ...S.card, ...S.cardPad, cursor: "pointer" }} onClick={() => openBatch(b.id)}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 4 }}>
+                    <span style={S.typeBadge(b.batchType)}>{cap(b.batchType)}</span>
+                    <span style={S.statusBadge(b.status)}>{b.status}</span>
+                    <span style={{ fontSize: 11, fontFamily: "monospace", opacity: 0.5 }}>{b.id}</span>
+                  </div>
+                  <div style={{ fontSize: 14, fontWeight: 800 }}>
+                    {b.fromCompany} → {b.toCompany}
+                  </div>
+                  <div style={{ fontSize: 12, opacity: 0.6, marginTop: 2 }}>
+                    {speciesSummary(b)} · {totalKg(b)} kg · Sent: {b.sentAt ? fmtDT(b.sentAt) : "—"}
+                  </div>
+                </div>
+                <div style={{ opacity: 0.7, fontSize: 12, fontWeight: 700 }}>{b.status === "Completed" ? "Delivered" : "Awaiting recipient"}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── CREATE DOCKET ────────────────────────────────────────────────────────────
+function CreateDocketView({ batchType, createBatch, speciesLibrary, companyLibrary, addToast, setView }: any) {
+  const isInbound = batchType === "inbound";
+  const ourCompany = lsGet(OUR_COMPANY_KEY);
+
+  const [fromCompany, setFromCompany] = useState(isInbound ? "" : ourCompany);
+  const [toCompany, setToCompany] = useState(isInbound ? ourCompany : "");
+  const [vesselRef, setVesselRef] = useState("");
+  const [orderDate, setOrderDate] = useState(new Date().toISOString().slice(0, 10));
+  const [lotRef, setLotRef] = useState("");
+  const [notes, setNotes] = useState("");
+
+  const [landingPort, setLandingPort] = useState("");
+  const [processingPlant, setProcessingPlant] = useState("");
+  const [catchCertNo, setCatchCertNo] = useState("");
+  const [landingCertNo, setLandingCertNo] = useState("");
+  const [processingCertNo, setProcessingCertNo] = useState("");
+  const [healthCertNo, setHealthCertNo] = useState("");
+
+  const [speciesLines, setSpeciesLines] = useState<SpeciesLine[]>([{ species: "", weightKg: 0 }]);
+  const [showCompliance, setShowCompliance] = useState(false);
+
+  const addSpecies = () => setSpeciesLines((p: SpeciesLine[]) => [...p, { species: "", weightKg: 0 }]);
+  const removeSpecies = (i: number) => setSpeciesLines((p: SpeciesLine[]) => p.filter((_, idx) => idx !== i));
+  const updateSpecies = (i: number, f: keyof SpeciesLine, v: any) =>
+    setSpeciesLines((p: SpeciesLine[]) => p.map((l, idx) => (idx === i ? { ...l, [f]: v } : l)));
+
+  const totalWeight = round2(speciesLines.reduce((a, l) => a + (+l.weightKg || 0), 0));
+
+  const handleCreate = () => {
+    if (!fromCompany || !toCompany) {
+      addToast("error", "From and To company are required");
+      return;
+    }
+    if (!speciesLines.some((l) => l.species)) {
+      addToast("error", "Add at least one species");
+      return;
+    }
+
+    const batch: Batch = {
+      id: uid(),
+      batchType,
+      status: "Created",
+      createdAt: nowISO(),
+      updatedAt: nowISO(),
+      fromCompany,
+      toCompany,
+      vesselRef,
+      orderDate,
+      lotRef,
+      notes,
+      speciesLines: speciesLines.map((l) => ({ ...l, weightKg: Number(l.weightKg) })).filter((l) => l.species),
+      transportLegs: [],
+      landingPort,
+      processingPlant,
+      catchCertNo,
+      landingCertNo,
+      processingCertNo,
+      healthCertNo,
+      locked: false,
+    };
+
+    createBatch(batch);
+    setView("batches");
+  };
+
+  return (
+    <div style={S.card}>
+      <div style={S.cardPad}>
+        <h2 style={{ ...S.h2, marginBottom: 4 }}>Create {cap(batchType)} Docket</h2>
+        <p style={{ ...S.small, marginBottom: 16, opacity: 0.6 }}>{isInbound ? "Supplier → Your Company" : "Your Company → Customer"}</p>
+        <div style={S.divider} />
+
+        <div style={S.formGrid}>
+          <div>
+            <label style={S.label}>{isInbound ? "From (Supplier) *" : "From (Your Company) *"}</label>
+            <input list="co-list" style={S.input} value={fromCompany} onChange={(e) => setFromCompany(e.target.value)} placeholder="Company name" />
+          </div>
+          <div>
+            <label style={S.label}>{isInbound ? "To (Your Company) *" : "To (Customer) *"}</label>
+            <input list="co-list" style={S.input} value={toCompany} onChange={(e) => setToCompany(e.target.value)} placeholder="Company name" />
+          </div>
+
+          <datalist id="co-list">
+            {[...new Set([...companyLibrary, ourCompany].filter(Boolean))].map((c: string) => (
+              <option key={c} value={c} />
+            ))}
+          </datalist>
+
+          <div>
+            <label style={S.label}>{isInbound ? "Vessel / Supplier Ref" : "Vehicle / Dispatch Ref"}</label>
+            <input style={S.input} value={vesselRef} onChange={(e) => setVesselRef(e.target.value)} placeholder="Optional" />
+          </div>
+          <div>
+            <label style={S.label}>Order Date</label>
+            <input type="date" style={S.input} value={orderDate} onChange={(e) => setOrderDate(e.target.value)} />
+          </div>
+          <div>
+            <label style={S.label}>Lot / Batch Ref</label>
+            <input style={S.input} value={lotRef} onChange={(e) => setLotRef(e.target.value)} placeholder="e.g. LOT-001" />
+          </div>
+        </div>
+
+        <div style={S.divider} />
+
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+          <h3 style={{ fontSize: 14, fontWeight: 900 }}>Species & Weights *</h3>
+          <button style={{ ...S.btn, fontSize: 11, padding: "6px 10px" }} onClick={addSpecies}>
+            + Add Species
+          </button>
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column" as const, gap: 8 }}>
+          {speciesLines.map((line, i) => (
+            <div key={i} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <select style={{ ...S.select, flex: 2 }} value={line.species} onChange={(e) => updateSpecies(i, "species", e.target.value)}>
+                <option value="">Select species</option>
+                {speciesLibrary.map((s: string) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
+              <input
+                type="number"
+                style={{ ...S.input, flex: 1 }}
+                value={Number.isFinite(Number(line.weightKg)) && Number(line.weightKg) !== 0 ? String(line.weightKg) : ""}
+                onChange={(e) => updateSpecies(i, "weightKg", e.target.value)}
+                placeholder="kg"
+              />
+              {speciesLines.length > 1 && (
+                <button style={{ ...S.btn, ...S.btnDanger, padding: "6px 10px", fontSize: 11 }} onClick={() => removeSpecies(i)}>
+                  ✕
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+
+        <div
+          style={{
+            marginTop: 10,
+            padding: "10px 14px",
+            background: "rgba(249,115,22,0.1)",
+            border: "1px solid rgba(249,115,22,0.3)",
+            borderRadius: 10,
+            fontSize: 14,
+            fontWeight: 900,
+          }}
+        >
+          Total Weight: {totalWeight} kg
+        </div>
+
+        <div style={S.divider} />
+
+        <button style={{ ...S.btn, ...S.btnSecondary, width: "100%", marginBottom: 12 }} onClick={() => setShowCompliance((p) => !p)}>
+          {showCompliance ? "▲" : "▼"} Compliance / Traceability Fields (optional)
+        </button>
+
+        {showCompliance && (
+          <div style={S.formGrid}>
+            <div>
+              <label style={S.label}>Landing Port</label>
+              <input style={S.input} value={landingPort} onChange={(e) => setLandingPort(e.target.value)} />
+            </div>
+            <div>
+              <label style={S.label}>Processing Plant</label>
+              <input style={S.input} value={processingPlant} onChange={(e) => setProcessingPlant(e.target.value)} />
+            </div>
+
+            <div>
+              <label style={S.label}>Catch Certificate #</label>
+              <input style={S.input} value={catchCertNo} onChange={(e) => setCatchCertNo(e.target.value)} placeholder="e.g. CATCH-123" />
+            </div>
+            <div>
+              <label style={S.label}>Landing Certificate #</label>
+              <input style={S.input} value={landingCertNo} onChange={(e) => setLandingCertNo(e.target.value)} placeholder="e.g. LAND-456" />
+            </div>
+            <div>
+              <label style={S.label}>Processing Certificate #</label>
+              <input style={S.input} value={processingCertNo} onChange={(e) => setProcessingCertNo(e.target.value)} placeholder="e.g. PROC-789" />
+            </div>
+            <div>
+              <label style={S.label}>Health Certificate #</label>
+              <input style={S.input} value={healthCertNo} onChange={(e) => setHealthCertNo(e.target.value)} placeholder="e.g. HEALTH-001" />
+            </div>
+          </div>
+        )}
+
+        <div>
+          <label style={S.label}>Notes</label>
+          <textarea style={{ ...S.input, minHeight: 70, resize: "vertical" as const }} value={notes} onChange={(e) => setNotes(e.target.value)} />
+        </div>
+
+        <div style={{ marginTop: 16 }}>
+          <button style={{ ...S.btn, ...S.btnPrimary, width: "100%", fontSize: 15, padding: "14px", fontWeight: 900 }} onClick={handleCreate}>
+            Create Docket (Draft)
+          </button>
+          <div style={{ ...S.small, marginTop: 10, opacity: 0.55 }}>
+            Draft only. For outbound, you must <b>Confirm Shipment</b> inside the batch before it becomes “Sent / In Transit”.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── BATCH DETAIL ─────────────────────────────────────────────────────────────
+function BatchDetail({ batch, updateBatch, deleteBatch, archiveBatch, unarchiveBatch, closeBatch, addToast, speciesLibrary, companyLibrary }: any) {
+  void speciesLibrary;
+
+  const locked = isLocked(batch);
+
+  const [landingCertNo, setLandingCertNo] = useState(batch.landingCertNo || "");
+  const [processingCertNo, setProcessingCertNo] = useState(batch.processingCertNo || "");
+  const [catchCertNo, setCatchCertNo] = useState(batch.catchCertNo || "");
+  const [healthCertNo, setHealthCertNo] = useState(batch.healthCertNo || "");
+  const [transportLegs, setTransportLegs] = useState<TransportLeg[]>(batch.transportLegs || []);
+
+  useEffect(() => {
+    setLandingCertNo(batch.landingCertNo || "");
+    setProcessingCertNo(batch.processingCertNo || "");
+    setCatchCertNo(batch.catchCertNo || "");
+    setHealthCertNo(batch.healthCertNo || "");
+    setTransportLegs(batch.transportLegs || []);
+  }, [batch.id]);
+
+  const saveCerts = () => {
+    if (locked) {
+      addToast("error", "This batch is locked. No changes allowed after shipment.");
+      return;
+    }
+    updateBatch(batch.id, { landingCertNo, processingCertNo, catchCertNo, healthCertNo, transportLegs });
+    addToast("success", "Saved");
+  };
+
+  const addLeg = () => {
+    if (locked) return;
+    setTransportLegs((p) => [...p, { transportCompany: "", vehicleReg: "", handoverTime: nowISO(), notes: "" }]);
+  };
+  const removeLeg = (i: number) => {
+    if (locked) return;
+    setTransportLegs((p) => p.filter((_, idx) => idx !== i));
+  };
+  const updateLeg = (i: number, f: keyof TransportLeg, v: string) => {
+    if (locked) return;
+    setTransportLegs((p) => p.map((l, idx) => (idx === i ? { ...l, [f]: v } : l)));
+  };
+
+  const encoded = encodeBatch({ ...batch, landingCertNo, processingCertNo, catchCertNo, healthCertNo, transportLegs });
+  const publicUrl = `${RESOLVER_BASE}/?receipt=${batch.id}&d=${encoded}`;
+
+  const confirmShipment = async () => {
+    if (!canConfirmShipment(batch)) {
+      addToast("error", "Shipment cannot be confirmed for this batch.");
+      return;
+    }
+    // eslint-disable-next-line no-restricted-globals
+    const ok = confirm(
+      `CONFIRM SHIPMENT?\n\nThis will mark the batch as IN TRANSIT (SENT) and LOCK it.\nNo edits, no delete, no rollback.\n\nContinue?`
+    );
+    if (!ok) return;
+
+    updateBatch(batch.id, {
+      landingCertNo,
+      processingCertNo,
+      catchCertNo,
+      healthCertNo,
+      transportLegs,
+      status: "In Transit",
+      sentAt: nowISO(),
+      locked: true,
+    });
+    addToast("success", "Shipment confirmed (In Transit / Sent)");
+  };
+
+  return (
+    <div style={S.card}>
+      <div style={S.cardPad}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap" as const, gap: 10, marginBottom: 16 }}>
+          <div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 4 }}>
+              <span style={S.typeBadge(batch.batchType)}>{cap(batch.batchType)}</span>
+              <span style={S.statusBadge(batch.status)}>{batch.status}</span>
+              {locked && <span style={{ ...S.statusBadge("In Transit" as any) }}>Locked</span>}
+            </div>
+            <h2 style={S.h2}>Batch {batch.id}</h2>
+            <p style={{ ...S.small, marginTop: 2, opacity: 0.55 }}>
+              Created {fmtDT(batch.createdAt)}
+              {batch.sentAt ? ` · Sent ${fmtDT(batch.sentAt)}` : ""}
+              {batch.receivedAt ? ` · Received ${fmtDT(batch.receivedAt)}` : ""}
+            </p>
+          </div>
+
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" as const }}>
+            {canConfirmShipment(batch) && (
+              <button style={{ ...S.btn, ...S.btnPrimary, fontWeight: 900 }} onClick={confirmShipment}>
+                Confirm Shipment (Sent)
+              </button>
+            )}
+
+            {batch.status === "Completed" && !batch.archived && (
+              <button
+                style={{ ...S.btn, ...S.btnDanger }}
+                onClick={() => {
+                  archiveBatch(batch.id);
+                  closeBatch();
+                }}
+              >
+                Archive
+              </button>
+            )}
+
+            {batch.archived && (
+              <button style={{ ...S.btn, ...S.btnSecondary }} onClick={() => unarchiveBatch(batch.id)}>
+                Unarchive
+              </button>
+            )}
+
+            <button
+              style={{ ...S.btn, ...S.btnDanger, opacity: locked ? 0.45 : 1 }}
+              disabled={locked}
+              onClick={() => {
+                // eslint-disable-next-line no-restricted-globals
+                if (confirm("Delete this batch?")) deleteBatch(batch.id);
+              }}
+              title={locked ? "Locked batches cannot be deleted" : "Delete"}
+            >
+              Delete
+            </button>
+
+            <button style={{ ...S.btn, ...S.btnSecondary }} onClick={closeBatch}>
+              Close
+            </button>
+          </div>
+        </div>
+
+        {locked && batch.status === "In Transit" && (
+          <div style={{ padding: "10px 12px", borderRadius: 12, marginBottom: 14, background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.25)", fontSize: 13, lineHeight: 1.5 }}>
+            <b>Locked:</b> This batch has been confirmed as <b>Sent / In Transit</b>. The sender cannot change anything now. The recipient must confirm via the QR receipt to complete the chain.
+          </div>
+        )}
+
+        <div style={S.divider} />
+
+        <div style={{ ...S.formGrid, marginBottom: 16 }}>
+          <KV label="From" value={batch.fromCompany} />
+          <KV label="To" value={batch.toCompany} />
+          <KV label="Vessel / Ref" value={batch.vesselRef} />
+          <KV label="Order Date" value={fmtDate(batch.orderDate)} />
+          <KV label="Lot Ref" value={batch.lotRef} />
+          {batch.landingPort && <KV label="Landing Port" value={batch.landingPort} />}
+          {batch.processingPlant && <KV label="Processing Plant" value={batch.processingPlant} />}
+        </div>
+
+        <div style={{ marginBottom: 16 }}>
+          <h3 style={{ fontSize: 13, fontWeight: 900, marginBottom: 10, opacity: 0.7, textTransform: "uppercase" as const, letterSpacing: 1 }}>Species & Weight</h3>
+          {(batch.speciesLines || []).map((l: SpeciesLine, i: number) => (
+            <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.05)", fontSize: 14 }}>
+              <span>{l.species}</span>
+              <span style={{ fontFamily: "monospace", color: "#F97316", fontWeight: 800 }}>{l.weightKg} kg</span>
+            </div>
+          ))}
+          <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 0", fontSize: 14, fontWeight: 900 }}>
+            <span>Total</span>
+            <span style={{ fontFamily: "monospace" }}>{totalKg(batch)} kg</span>
+          </div>
+        </div>
+
+        <div style={S.divider} />
+
+        <h3 style={{ fontSize: 13, fontWeight: 900, marginBottom: 12, opacity: 0.7, textTransform: "uppercase" as const, letterSpacing: 1 }}>
+          Certification Numbers
+        </h3>
+        <div style={S.formGrid}>
+          {(
+            [
+              ["Landing Cert No", landingCertNo, setLandingCertNo],
+              ["Processing Cert No", processingCertNo, setProcessingCertNo],
+              ["Catch Cert No", catchCertNo, setCatchCertNo],
+              ["Health Cert No", healthCertNo, setHealthCertNo],
+            ] as any[]
+          ).map(([label, val, setter]) => (
+            <div key={label as string}>
+              <label style={S.label}>{label}</label>
+              <input style={{ ...S.input, opacity: locked ? 0.6 : 1 }} value={val} onChange={(e) => setter(e.target.value)} placeholder="Enter cert number" disabled={locked} />
+            </div>
+          ))}
+        </div>
+
+        <div style={S.divider} />
+
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+          <h3 style={{ fontSize: 13, fontWeight: 900, opacity: 0.7, textTransform: "uppercase" as const, letterSpacing: 1 }}>Transport / Handover Logs</h3>
+          <button style={{ ...S.btn, fontSize: 11, padding: "6px 10px", opacity: locked ? 0.5 : 1 }} onClick={addLeg} disabled={locked}>
+            + Add Leg
+          </button>
+        </div>
+
+        {transportLegs.length === 0 && <p style={{ ...S.small, opacity: 0.45, marginBottom: 16 }}>No transport legs added yet.</p>}
+
+        {transportLegs.map((leg, i) => (
+          <div key={i} style={{ ...S.subCard, marginBottom: 10, opacity: locked ? 0.75 : 1 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+              <span style={{ fontSize: 12, fontWeight: 800, opacity: 0.6 }}>Leg {i + 1}</span>
+              <button style={{ ...S.btn, ...S.btnDanger, fontSize: 11, padding: "3px 8px", opacity: locked ? 0.5 : 1 }} onClick={() => removeLeg(i)} disabled={locked}>
+                Remove
+              </button>
+            </div>
+
+            <div style={S.formGrid}>
+              <div>
+                <label style={S.label}>Transport Company</label>
+                <input list="co-list2" style={S.input} value={leg.transportCompany} onChange={(e) => updateLeg(i, "transportCompany", e.target.value)} disabled={locked} />
+                <datalist id="co-list2">
+                  {companyLibrary.map((c: string) => (
+                    <option key={c} value={c} />
+                  ))}
+                </datalist>
+              </div>
+
+              <div>
+                <label style={S.label}>Vehicle Reg</label>
+                <input style={S.input} value={leg.vehicleReg} onChange={(e) => updateLeg(i, "vehicleReg", e.target.value)} disabled={locked} />
+              </div>
+
+              <div>
+                <label style={S.label}>Handover Time</label>
+                <input type="datetime-local" style={S.input} value={leg.handoverTime?.slice(0, 16) || ""} onChange={(e) => updateLeg(i, "handoverTime", e.target.value)} disabled={locked} />
+              </div>
+
+              <div>
+                <label style={S.label}>Notes</label>
+                <input style={S.input} value={leg.notes || ""} onChange={(e) => updateLeg(i, "notes", e.target.value)} disabled={locked} />
+              </div>
+            </div>
+          </div>
+        ))}
+
+        <button style={{ ...S.btn, ...S.btnPrimary, width: "100%", marginBottom: 16, opacity: locked ? 0.55 : 1 }} onClick={saveCerts} disabled={locked}>
+          Save Certs & Transport
+        </button>
+
+        <div style={S.divider} />
+
+        {batch.notes && (
+          <div style={{ marginBottom: 16 }}>
+            <h3 style={{ fontSize: 13, fontWeight: 900, marginBottom: 8, opacity: 0.7, textTransform: "uppercase" as const, letterSpacing: 1 }}>Notes</h3>
+            <p style={{ fontSize: 13, lineHeight: 1.6, opacity: 0.85 }}>{batch.notes}</p>
+          </div>
+        )}
+
+        <div style={S.divider} />
+
+        <div>
+          <h3 style={{ fontSize: 13, fontWeight: 900, marginBottom: 12, opacity: 0.7, textTransform: "uppercase" as const, letterSpacing: 1 }}>
+            QR Code — Receipt
+          </h3>
+          <div style={{ background: "#fff", padding: 16, borderRadius: 12, display: "inline-block", marginBottom: 10 }}>
+            <QRCodeSVG value={publicUrl} size={160} />
+          </div>
+          <p style={{ ...S.small, marginTop: 6 }}>Scan to view receipt on any device</p>
+          <p style={{ ...S.small, marginTop: 4, opacity: 0.55, wordBreak: "break-all" as const, fontSize: 11 }}>{publicUrl}</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function KV({ label, value }: { label: string; value: string }) {
+  if (!value) return null;
+  return (
+    <div style={{ padding: "8px 10px", background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.05)", borderRadius: 8, fontSize: 13 }}>
+      <div style={{ fontSize: 11, opacity: 0.5, marginBottom: 3 }}>{label}</div>
+      <div style={{ fontWeight: 800 }}>{value}</div>
+    </div>
+  );
+}
+
+// ─── EOW VIEW ─────────────────────────────────────────────────────────────────
+function EOWView({ batches, openBatch }: any) {
+  const totalWeight = round2(batches.reduce((a: number, b: Batch) => a + totalKg(b), 0));
+  return (
+    <div>
+      <h2 style={{ fontSize: 20, fontWeight: 900, marginBottom: 4 }}>End of Week</h2>
+      <p style={{ ...S.small, opacity: 0.55, marginBottom: 20 }}>
+        {batches.length} completed batches · {totalWeight} kg total
+      </p>
+      {batches.length === 0 ? (
+        <div style={{ ...S.card, padding: 24, textAlign: "center" as const, opacity: 0.55 }}>No completed batches yet</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column" as const, gap: 10 }}>
+          {batches.map((b: Batch) => (
+            <div key={b.id} style={{ ...S.card, ...S.cardPad, cursor: "pointer" }} onClick={() => openBatch(b.id)}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 900, marginBottom: 2 }}>
+                    {b.fromCompany} → {b.toCompany}
+                  </div>
+                  <div style={{ fontSize: 12, opacity: 0.55 }}>
+                    {speciesSummary(b)} · {totalKg(b)} kg · {fmtDate(b.orderDate)}
+                  </div>
+                </div>
+                <span style={S.typeBadge(b.batchType)}>{cap(b.batchType)}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── ARCHIVE VIEW ─────────────────────────────────────────────────────────────
+function ArchiveView({ batches, openBatch, unarchiveBatch }: any) {
+  return (
+    <div>
+      <h2 style={{ fontSize: 20, fontWeight: 900, marginBottom: 20 }}>Archive</h2>
+      {batches.length === 0 ? (
+        <div style={{ ...S.card, padding: 24, textAlign: "center" as const, opacity: 0.55 }}>No archived batches</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column" as const, gap: 10 }}>
+          {batches.map((b: Batch) => (
+            <div key={b.id} style={{ ...S.card, ...S.cardPad, display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }} onClick={() => openBatch(b.id)}>
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 900, marginBottom: 2 }}>
+                  {b.fromCompany} → {b.toCompany}
+                </div>
+                <div style={{ fontSize: 12, opacity: 0.55 }}>{speciesSummary(b)} · {totalKg(b)} kg</div>
+              </div>
+              <button
+                style={{ ...S.btn, ...S.btnSecondary, fontSize: 11, padding: "4px 10px" }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  unarchiveBatch(b.id);
+                }}
+              >
+                Unarchive
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── LIBRARY VIEW ─────────────────────────────────────────────────────────────
+function LibraryView({ title, items, setItems, addToast }: any) {
+  const [newItem, setNewItem] = useState("");
+
+  const add = () => {
+    const v = newItem.trim();
+    if (!v || items.includes(v)) {
+      addToast("error", "Already exists or empty");
+      return;
+    }
+    setItems([...items, v]);
+    setNewItem("");
+    addToast("success", "Added");
+  };
+
+  const remove = (item: string) => {
+    setItems(items.filter((i: string) => i !== item));
+    addToast("info", "Removed");
+  };
+
+  return (
+    <div style={S.card}>
+      <div style={S.cardPad}>
+        <h2 style={{ ...S.h2, marginBottom: 16 }}>{title}</h2>
+        <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
+          <input
+            style={{ ...S.input, flex: 1 }}
+            value={newItem}
+            onChange={(e) => setNewItem(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && add()}
+            placeholder="Add new..."
+          />
+          <button style={{ ...S.btn, ...S.btnPrimary, fontWeight: 900 }} onClick={add}>
+            Add
+          </button>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column" as const, gap: 6 }}>
+          {items.map((item: string) => (
+            <div
+              key={item}
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                padding: "8px 12px",
+                background: "rgba(255,255,255,0.02)",
+                border: "1px solid rgba(255,255,255,0.06)",
+                borderRadius: 8,
+                fontSize: 13,
+              }}
+            >
+              <span>{item}</span>
+              <button style={{ ...S.btn, ...S.btnDanger, fontSize: 11, padding: "3px 8px" }} onClick={() => remove(item)}>
+                Remove
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── SETTINGS ─────────────────────────────────────────────────────────────────
+function SettingsView({ addToast }: any) {
+  const [ourCompany, setOurCompany] = useState(lsGet(OUR_COMPANY_KEY));
+  const save = () => {
+    lsSet(OUR_COMPANY_KEY, ourCompany.trim());
+    addToast("success", "Settings saved");
+  };
+  return (
+    <div style={S.card}>
+      <div style={S.cardPad}>
+        <h2 style={{ ...S.h2, marginBottom: 16 }}>Settings</h2>
+
+        <div style={{ marginBottom: 16 }}>
+          <label style={S.label}>Your Company Name</label>
+          <input style={S.input} value={ourCompany} onChange={(e) => setOurCompany(e.target.value)} placeholder="e.g. Portavogie Fish Co." />
+          <p style={{ ...S.small, marginTop: 6, opacity: 0.55 }}>Used to auto-fill the "From" or "To" field when creating dockets.</p>
+        </div>
+
+        <div style={{ marginBottom: 16, padding: 12, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 10, fontSize: 13 }}>
+          <strong>Resolver URL:</strong>
+          <br />
+          <span style={{ fontFamily: "monospace", fontSize: 11, opacity: 0.7 }}>{RESOLVER_BASE}/?receipt=ID&d=ENCODED</span>
+          <p style={{ marginTop: 6, opacity: 0.55, fontSize: 12 }}>QR codes point here. External “Confirm Receipt” requires Supabase configured.</p>
+        </div>
+
+        <div style={{ marginBottom: 16, padding: 12, background: "rgba(59,130,246,0.08)", border: "1px solid rgba(59,130,246,0.18)", borderRadius: 10, fontSize: 13 }}>
+          <strong>Supabase status:</strong>{" "}
+          <span style={{ fontWeight: 900 }}>{SUPABASE_URL && SUPABASE_ANON ? "Configured ✅" : "Not configured (local-only) ⚠️"}</span>
+          <div style={{ marginTop: 6, opacity: 0.65, fontSize: 12, lineHeight: 1.5 }}>
+            If not configured, batches are localStorage only and external receipt confirmation cannot update your system.
+          </div>
+        </div>
+
+        <button style={{ ...S.btn, ...S.btnPrimary, fontWeight: 900 }} onClick={save}>
+          Save Settings
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── STYLES ───────────────────────────────────────────────────────────────────
+const S = {
+  app: { minHeight: "100vh", background: "#080D14", color: "#E8EDF5", fontFamily: "system-ui,sans-serif" },
+  header: {
+    background: "rgba(255,255,255,0.02)",
+    borderBottom: "1px solid rgba(255,255,255,0.07)",
+    padding: "12px 20px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    flexWrap: "wrap" as const,
+    gap: 12,
+  },
+  container: { maxWidth: 1100, margin: "0 auto", padding: "24px 16px" },
+  card: {
+    background: "rgba(255,255,255,0.03)",
+    border: "1px solid rgba(255,255,255,0.07)",
+    borderRadius: 16,
+    boxShadow: "0 8px 32px rgba(0,0,0,0.3)",
+  },
+  cardPad: { padding: 20 },
+  subCard: { background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 14 },
+  divider: { height: 1, background: "rgba(255,255,255,0.06)", margin: "16px 0" },
+  h2: { fontSize: 16, fontWeight: 900, letterSpacing: 0.2 },
+  small: { fontSize: 12, lineHeight: 1.4 },
+  label: { fontSize: 12, opacity: 0.75, marginBottom: 5, display: "block" as const },
+  formGrid: { display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 12 },
+  input: {
+    width: "100%",
+    background: "rgba(15,23,42,0.6)",
+    border: "1px solid rgba(255,255,255,0.08)",
+    color: "#E8EDF5",
+    borderRadius: 10,
+    padding: "9px 12px",
+    fontSize: 13,
+    outline: "none",
+    boxSizing: "border-box" as const,
+  },
+  select: {
+    width: "100%",
+    background: "rgba(15,23,42,0.6)",
+    border: "1px solid rgba(255,255,255,0.08)",
+    color: "#E8EDF5",
+    borderRadius: 10,
+    padding: "9px 12px",
+    fontSize: 13,
+    outline: "none",
+    boxSizing: "border-box" as const,
+  },
+  btn: {
+    cursor: "pointer",
+    background: "rgba(255,255,255,0.04)",
+    border: "1px solid rgba(255,255,255,0.1)",
+    color: "#E8EDF5",
+    borderRadius: 10,
+    padding: "9px 14px",
+    fontSize: 13,
+    fontWeight: 700,
+  },
+  btnPrimary: { background: "rgba(249,115,22,0.2)", borderColor: "rgba(249,115,22,0.4)", color: "#F97316" },
+  btnSecondary: { background: "rgba(255,255,255,0.03)", borderColor: "rgba(255,255,255,0.1)" },
+  btnDanger: { background: "rgba(239,68,68,0.15)", borderColor: "rgba(239,68,68,0.3)", color: "#EF4444" },
+  navBtn: {
+    cursor: "pointer",
+    background: "rgba(255,255,255,0.03)",
+    border: "1px solid rgba(255,255,255,0.07)",
+    color: "#E8EDF5",
+    borderRadius: 8,
+    padding: "7px 12px",
+    fontSize: 12,
+    fontWeight: 700,
+  },
+  navBtnActive: { borderColor: "rgba(249,115,22,0.5)", background: "rgba(249,115,22,0.12)", color: "#F97316" },
+  tabBtn: {
+    cursor: "pointer",
+    background: "rgba(255,255,255,0.03)",
+    border: "1px solid rgba(255,255,255,0.07)",
+    color: "#E8EDF5",
+    borderRadius: 20,
+    padding: "7px 16px",
+    fontSize: 12,
+    fontWeight: 800,
+  },
+  tabBtnActive: { borderColor: "rgba(249,115,22,0.5)", background: "rgba(249,115,22,0.12)", color: "#F97316" },
+  tile: { background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 14, padding: 16 },
+  tileLabel: { fontSize: 12, opacity: 0.6, marginBottom: 8 },
+  tileValue: { fontSize: 30, fontWeight: 900 },
+  actionTile: {
+    cursor: "pointer",
+    background: "rgba(255,255,255,0.02)",
+    border: "1px solid rgba(255,255,255,0.06)",
+    color: "#E8EDF5",
+    borderRadius: 14,
+    padding: 20,
+    textAlign: "center" as const,
+    width: "100%",
+  },
+  typeBadge: (t: BatchType) => ({
+    display: "inline-flex",
+    alignItems: "center",
+    padding: "3px 10px",
+    borderRadius: 999,
+    fontSize: 11,
+    fontWeight: 900,
+    background: t === "inbound" ? "rgba(59,130,246,0.15)" : "rgba(249,115,22,0.15)",
+    color: t === "inbound" ? "#3B82F6" : "#F97316",
+    border: `1px solid ${t === "inbound" ? "rgba(59,130,246,0.3)" : "rgba(249,115,22,0.3)"}`,
+  }),
+  statusBadge: (s: BatchStatus) => {
+    const m: any = {
+      Created: { bg: "rgba(59,130,246,0.15)", c: "#3B82F6", b: "rgba(59,130,246,0.3)" },
+      "In Transit": { bg: "rgba(245,158,11,0.15)", c: "#F59E0B", b: "rgba(245,158,11,0.3)" },
+      Completed: { bg: "rgba(34,197,94,0.15)", c: "#22C55E", b: "rgba(34,197,94,0.3)" },
+      Archived: { bg: "rgba(148,163,184,0.1)", c: "#94A3B8", b: "rgba(148,163,184,0.2)" },
+    };
+    const x = m[s] || m.Created;
+    return {
+      display: "inline-flex",
+      alignItems: "center",
+      padding: "3px 10px",
+      borderRadius: 999,
+      fontSize: 11,
+      fontWeight: 900,
+      background: x.bg,
+      color: x.c,
+      border: `1px solid ${x.b}`,
+    };
+  },
+};
