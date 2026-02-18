@@ -631,6 +631,8 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
         ? null
         : batch.batchType === "inbound" && batch.status === "Created"
         ? "dispatch"
+        : batch.batchType === "outbound" && batch.status === "Created"
+        ? "dispatch"
         : batch.batchType === "outbound" && batch.status === "In Transit"
         ? "receipt"
         : null;
