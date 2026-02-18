@@ -16,7 +16,7 @@ import { QRCodeSVG } from "qrcode.react";
 import { createClient, type Session, type User } from "@supabase/supabase-js";
 
 /* ---------- localStorage helpers (BUILD-SAFE) ---------- */
-function lsGet(key: string): string {a
+function lsGet(key: string): string {
   try {
     return window.localStorage.getItem(key) ?? "";
   } catch {
@@ -516,6 +516,8 @@ function canConfirmShipment(b: Batch): boolean {
 function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: string | null }) {
   const [loading, setLoading] = useState(true);
   const [batch, setBatch] = useState<any | null>(null);
+
+  const [isConfirmed, setIsConfirmed] = useState(false);
   const [err, setErr] = useState<string>("");
   const [done, setDone] = useState(false);
 
