@@ -12,6 +12,8 @@
 //   NOTE: External receipt confirmation only truly works with Supabase because a phone scanning QR does not share your localStorage.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+
+const BUILD_TAG = 'CONFIRM-INBOUND-OUTBOUND-WORKING-v1';
 import { QRCodeSVG } from "qrcode.react";
 import { createClient, type Session, type User } from "@supabase/supabase-js";
 
@@ -627,9 +629,7 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
     if (!batch?.id) return;
 
     const action: "dispatch" | "receipt" | null =
-      !token
-        ? null
-        : batch.batchType === "inbound" && batch.status === "Created"
+      batch.batchType === "inbound" && batch.status === "Created"
         ? "dispatch"
         : batch.batchType === "outbound" && batch.status === "Created"
         ? "dispatch"
@@ -691,7 +691,7 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
             <div style={{ fontWeight: 900, marginBottom: 6 }}>Receipt not available</div>
             <div>{err}</div>
           </div>
-          <div className="footer">Powered by Core Systems NI · Batch ID Pro</div>
+          <div className="footer">Powered by Core Systems NI · Batch ID Pro · {BUILD_TAG}</div>
         </div>
       </div>
     );
@@ -754,14 +754,13 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
             // - Inbound + Created  => Supplier confirms dispatch (moves to In Transit)
             // - Outbound + In Transit => Buyer confirms receipt (moves to Completed)
             const action: "dispatch" | "receipt" | null =
-              !token
-                ? null
-                :
-              batch?.batchType === "inbound" && batch?.status === "Created"
-                ? "dispatch"
-                : batch?.batchType === "outbound" && batch?.status === "In Transit"
-                ? "receipt"
-                : null;
+      batch.batchType === "inbound" && batch.status === "Created"
+        ? "dispatch"
+        : batch.batchType === "outbound" && batch.status === "Created"
+        ? "dispatch"
+        : batch.batchType === "outbound" && batch.status === "In Transit"
+        ? "receipt"
+        : null;
 
             const label =
               action === "dispatch"
@@ -802,7 +801,7 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
               );
             }
 
-            if (!token) {
+            if (!token && action === "receipt") {
               return (
                 <>
                   <div style={{ fontWeight: 800, marginBottom: 8 }}>Confirmation link missing token</div>
@@ -916,7 +915,7 @@ function PublicReceipt({ receiptId, encoded }: { receiptId: string; encoded: str
           </div>
         )}
 
-        <div className="footer">Powered by Core Systems NI · Batch ID Pro</div>
+        <div className="footer">Powered by Core Systems NI · Batch ID Pro · {BUILD_TAG}</div>
       </div>
     </div>
   );
