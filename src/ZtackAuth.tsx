@@ -38,7 +38,7 @@ export function ZtackAuth({ onLogin }: { onLogin: (user: Account) => void }) {
       {mode !== "verify" && <form onSubmit={submit}>
         {mode === "register" && <label>Company name<input required value={company} onChange={e=>setCompany(e.target.value)} style={{display:"block",width:"100%",padding:10,boxSizing:"border-box",marginBottom:12}} /></label>}
         {mode !== "reset" && <label>Email<input required type="email" autoComplete="email" value={email} onChange={e=>setEmail(e.target.value)} style={{display:"block",width:"100%",padding:10,boxSizing:"border-box",marginBottom:12}} /></label>}
-        {mode !== "forgot" && <label>Password<input required minLength={12} type="password" autoComplete={mode === "login" ? "current-password" : "new-password"} value={password} onChange={e=>setPassword(e.target.value)} style={{display:"block",width:"100%",padding:10,boxSizing:"border-box",marginBottom:12}} /></label>}
+        {mode !== "forgot" && <label>Password<input required minLength={mode === "login" ? 1 : 12} type="password" autoComplete={mode === "login" ? "current-password" : "new-password"} value={password} onChange={e=>setPassword(e.target.value)} style={{display:"block",width:"100%",padding:10,boxSizing:"border-box",marginBottom:12}} /></label>}
         <button disabled={busy} style={{padding:12,width:"100%",background:"#365de5",color:"white",border:0,borderRadius:8,cursor:"pointer"}}>{busy ? "Please wait…" : mode === "login" ? "Sign in" : mode === "register" ? "Create company" : mode === "forgot" ? "Send reset email" : "Save new password"}</button>
       </form>}
       {mode === "verify" && <button onClick={()=>setMode("login")}>Back to sign in</button>}
