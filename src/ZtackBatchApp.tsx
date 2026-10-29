@@ -24,7 +24,9 @@ export default function ZtackBatchApp() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [showArchived, setShowArchived] = useState(false);
-  const receiptId = new URLSearchParams(window.location.search).get("receipt");
+  const query = new URLSearchParams(window.location.search);
+  const authAction = query.get("action");
+  const receiptId = query.get("receipt");
   const receiptToken = new URLSearchParams(window.location.search).get("token") || receiptId;
   const [receipt, setReceipt] = useState<Docket | null>(null);
   const [receiptLoading, setReceiptLoading] = useState(!!receiptId);
@@ -85,7 +87,7 @@ export default function ZtackBatchApp() {
     </> : null}
   </main>;
   if (loading) return <main className="batch-loading">Connecting to Batch ID Pro…</main>;
-  if (!user) return <ZtackAuth onLogin={setUser}/>;
+  if (!user || authAction === "verify" || authAction === "reset") return <ZtackAuth onLogin={setUser}/>;
   const canEdit = user.role === "Owner";
   return <div className="batch-layout">
     <aside className="batch-sidebar">
