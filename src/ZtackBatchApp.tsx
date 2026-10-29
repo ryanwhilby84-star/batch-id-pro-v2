@@ -66,7 +66,7 @@ export default function ZtackBatchApp() {
     try {
       const companyId = user?.company_id || "";
       const d: Docket = {id:crypto.randomUUID(),batchId:"NEW",type:direction,status:"Created",lines:[{speciesCode:draft.species.trim().slice(0,30).toUpperCase(),speciesName:draft.species,qty:draft.weight_kg}],version:1,fromCompanyId:direction==="Outbound"?companyId:"external",toCompanyId:direction==="Inbound"?companyId:"external",fromCompanyName:draft.from_company,toCompanyName:draft.to_company,createdAt:new Date().toISOString(),notes:draft.notes};
-      await api("/dockets", {method:"POST",body:JSON.stringify(d)});
+      await api("/dockets", {method:"POST",body:JSON.stringify(Object.fromEntries(Object.entries(d).filter(([key])=>key!=="version")))});
       setDraft(empty);setView("dockets");setNotice("Docket created.");await refresh();
     } catch(e){setError(e instanceof Error ? e.message : "Could not create docket");}
     finally{setBusy(false);}
@@ -116,7 +116,7 @@ export default function ZtackBatchApp() {
 }
 function DocketTable({items,onSelect}:{items:Docket[];onSelect:(d:Docket)=>void}) {
   if (!items.length) return <div className="batch-empty">No dockets found.</div>;
-  return <div className="batch-table-wrap"><table><thead><tr><th>Docket</th><th>Species</th><th>Origin</th><th>Destination</th><th>Status</th><th>Created</th></tr></thead><tbody>{items.map(d=><tr key={d.id} onClick={()=>onSelect(d)} tabIndex={0} onKeyDown={e=>{if(e.key==="Enter")onSelect(d);}}><td>{label(d)}</td><td>{species(d)||"—"}</td><td>{d.from_company||"—"}</td><td>{d.to_company||"—"}</td><td><span className="batch-pill">{d.status}</span></td><td>{formatDate(d.created_at)}</td></tr>)}</tbody></table></div>;
+  return <div className="batch-table-wrap"><table><thead><tr><th>Docket</th><th>Species</th><th>Origin</th><th>Destination</th><th>Status</th><th>Created</th></tr></thead><tbody>{items.map(d=><tr key={d.id} onClick={()=>onSelect(d)} tabIndex={0} onKeyDown={e=>{if(e.key==="Enter")onSelect(d);}}><td>{label(d)}</td><td>{species(d)||"—"}</td><td>{d.fromCompanyName||"—"}</td><td>{d.toCompanyName||"—"}</td><td><span className="batch-pill">{d.status}</span></td><td>{formatDate(d.createdAt)}</td></tr>)}</tbody></table></div>;
 }
 function ReceiptQr({id}:{id:string}) {
   const [url,setUrl]=useState("");const [error,setError]=useState("");
