@@ -1443,14 +1443,12 @@ const [speciesLibrary, setSpeciesLibrary] = useState<string[]>(() => lsJson(SPEC
     );
   }
 
-  if (!vpsAccount) {
+  const authAction = new URLSearchParams(window.location.search).get("action");
+  if (!vpsAccount || authAction === "reset" || authAction === "verify") {
     return <ZtackAuth onLogin={setVpsAccount} />;
   }
 
-  if (supabase && !user) {
-    return <AuthScreen onAuth={() => window.location.reload()} />;
-
-  }
+  // Legacy Supabase login must never appear during VPS migration.
 
 
 
@@ -1458,11 +1456,11 @@ const [speciesLibrary, setSpeciesLibrary] = useState<string[]>(() => lsJson(SPEC
 
   // ── Auth / Company gating (must be after all hooks to avoid React #310 hook-order crash) ──
 
-  if (supabase && companies.length > 1 && !selectedCompanyId) {
+  if (!vpsAccount && supabase && companies.length > 1 && !selectedCompanyId) {
     return <CompanySelector companies={companies} onSelect={setSelectedCompanyId} />;
   }
 
-  if (supabase && !selectedCompanyId) {
+  if (!vpsAccount && supabase && !selectedCompanyId) {
     return (
       <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#080D14", color: "white" }}>
         <div>No companies found. Contact your administrator.</div>
