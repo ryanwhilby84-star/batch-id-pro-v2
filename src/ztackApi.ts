@@ -3,12 +3,12 @@
  * Backend contract must be implemented before switching production traffic.
  */
 const configured = import.meta.env.VITE_BATCH_API_URL as string | undefined;
-export const API_BASE = (configured || "").replace(/\/$/, "");
+export const API_BASE = ""; // Same-origin Vercel proxy avoids cross-site cookie and CORS failures.
 let csrf = "";
 export function setCsrf(value: string) { csrf = value; }
 export type ApiError = Error & { status?: number };
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-  if (!API_BASE || !API_BASE.startsWith("https://")) throw new Error("Secure Batch API URL is not configured");
+  if (window.location.protocol !== "https:" && window.location.hostname !== "localhost") throw new Error("HTTPS is required");
   const headers = new Headers(init.headers);
   if (csrf && init.method && init.method !== "GET") headers.set("X-CSRF-Token", csrf);
   if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
