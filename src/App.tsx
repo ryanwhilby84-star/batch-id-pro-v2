@@ -14,7 +14,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { createClient, type Session, type User } from "@supabase/supabase-js";
-import { authApi, type Account } from "./ztackApi";
+import { api, authApi, type Account } from "./ztackApi";
 import { ZtackAuth } from "./ZtackAuth";
 
 /* ---------- localStorage helpers (BUILD-SAFE) ---------- */
@@ -218,51 +218,16 @@ function saveBatchesLocal(b: Batch[]) {
   lsSet(STORAGE_KEY, JSON.stringify(b));
 }
 
-// Supabase-backed batches (per your schema)
-async function loadBatches(companyId: string): Promise<Batch[]> {
-  if (!supabase) return loadBatchesLocal();
-
-  const { data, error } = await supabase
-    .from("batches")
-    .select("*")
-    .eq("company_id", companyId)
-    .order("created_at", { ascending: false });
-
-  if (error) {
-    console.error("Error loading batches:", error);
-    return [];
-  }
-
-  return (data || []).map((r: any) => {
-    const status = (r.status as BatchStatus) || "Created";
-    const updatedAt = r.updated_at || r.created_at || new Date().toISOString();
-    return {
-      id: String(r.id),
-      batchType: r.batch_type as BatchType,
-      status,
-      createdAt: r.created_at || new Date().toISOString(),
-      updatedAt,
-      fromCompany: r.from_company || "",
-      toCompany: r.to_company || "",
-      vesselRef: r.vessel_ref || "",
-      orderDate: r.order_date || "",
-      lotRef: r.lot_ref || "",
-      notes: r.notes || "",
-      speciesLines: (r.species_lines || []) as SpeciesLine[],
-      transportLegs: (r.transport_legs || []) as TransportLeg[],
-      archived: !!r.archived,
-      landingCertNo: r.landing_cert_no || "",
-      processingCertNo: r.processing_cert_no || "",
-      catchCertNo: r.catch_cert_no || "",
-      healthCertNo: r.health_cert_no || "",
-      landingPort: r.landing_port || "",
-      processingPlant: r.processing_plant || "",
-      // Derived (schema-safe)
-      locked: status !== "Created",
-      sentAt: status === "In Transit" ? updatedAt : undefined,
-      receivedAt: status === "Completed" ? updatedAt : undefined,
-    } as Batch;
-  });
+// VPS-backed batch listing. The original presentation and workflow components remain intact.
+type ServerDocket = { id:string; batchId?:string; type?:string; status?:string; lines?:Array<{speciesName?:string;qty?:number}>; createdAt?:string; completedAt?:string; fromCompanyName?:string; toCompanyName?:string; notes?:string; version?:number };
+function docketToBatch(d:ServerDocket):Batch {
+ const status:BatchStatus = /complete/i.test(d.status||"") ? "Completed" : /transit|sent/i.test(d.status||"") ? "In Transit" : /void|archiv/i.test(d.status||"") ? "Archived" : "Created";
+ const date=d.createdAt||new Date().toISOString();
+ return {id:d.id,batchType:/inbound/i.test(d.type||"")?"inbound":"outbound",status,createdAt:date,updatedAt:d.completedAt||date,fromCompany:d.fromCompanyName||"",toCompany:d.toCompanyName||"",vesselRef:"",orderDate:date.slice(0,10),lotRef:d.batchId||"",notes:d.notes||"",speciesLines:(d.lines||[]).map(l=>({species:l.speciesName||"",weightKg:Number(l.qty||0)})),transportLegs:[],archived:status==="Archived",locked:status!=="Created",receivedAt:d.completedAt};
+}
+async function loadBatches(_companyId:string):Promise<Batch[]> {
+ const rows=await api<ServerDocket[]>("/dockets");
+ return rows.map(docketToBatch);
 }
 
 // ─── UTILS ───────────────────────────────────────────────────────────────────
@@ -1123,7 +1088,7 @@ function AppInner() {
   const [vpsAccount, setVpsAccount] = useState<Account | null>(null);
   const [vpsAuthLoading, setVpsAuthLoading] = useState(true);
   const [user, setUser] = useState<User | null>(null);
-  const [authLoading, setAuthLoading] = useState<boolean>(!!supabase);
+  const [authLoading, setAuthLoading] = useState<boolean>(false);
   const [companies, setCompanies] = useState<any[]>([]);
   const [selectedCompanyId, setSelectedCompanyId] = useState<string | null>(null);
   const selectedCompany = useMemo(() => companies.find((c: any) => c?.id === selectedCompanyId) || null, [companies, selectedCompanyId]);
@@ -1192,20 +1157,19 @@ function AppInner() {
       if (companyList.length === 1) setSelectedCompanyId(companyList[0].id);
     })();
   }, [user]);
-    const [batches, setBatches] = useState<Batch[]>(() => (supabase ? [] : loadBatchesLocal()));
+    const [batches, setBatches] = useState<Batch[]>([]);
 
   // Persist local batches when running without Supabase
   useEffect(() => {
-    if (supabase) return;
+    if (true) return;
     saveBatchesLocal(batches);
   }, [batches]);
 
     // Load batches for active company (Supabase mode)
   useEffect(() => {
-    if (!supabase) return;
-    if (!activeCompanyId) return;
-    loadBatches(activeCompanyId).then(setBatches);
-  }, [activeCompanyId]);
+    if (!vpsAccount) return;
+    loadBatches(vpsAccount.company_id).then(setBatches).catch(err=>console.error("VPS docket load failed",err));
+  }, [vpsAccount]);
 
 const [speciesLibrary, setSpeciesLibrary] = useState<string[]>(() => lsJson(SPECIES_KEY, DEFAULT_SPECIES));
   const [companyLibrary, setCompanyLibrary] = useState<string[]>(() => lsJson(COMPANY_KEY, DEFAULT_COMPANIES));
@@ -1215,7 +1179,7 @@ const [speciesLibrary, setSpeciesLibrary] = useState<string[]>(() => lsJson(SPEC
 
   // Persist local batches
   useEffect(() => {
-    saveBatches(batches);
+    // Never overwrite persisted local data during VPS migration.
   }, [batches]);
 
   useEffect(() => {
