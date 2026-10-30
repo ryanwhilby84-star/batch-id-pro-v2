@@ -132,6 +132,7 @@ type TransportLeg = { transportCompany: string; vehicleReg: string; handoverTime
 
 interface Batch {
   id: string;
+  serverVersion?: number;
   batchType: BatchType;
   status: BatchStatus;
   createdAt: string;
@@ -223,7 +224,7 @@ type ServerDocket = { id:string; batchId?:string; type?:string; status?:string; 
 function docketToBatch(d:ServerDocket):Batch {
  const status:BatchStatus = /complete/i.test(d.status||"") ? "Completed" : /transit|sent/i.test(d.status||"") ? "In Transit" : /void|archiv/i.test(d.status||"") ? "Archived" : "Created";
  const date=d.createdAt||new Date().toISOString();
- return {id:d.id,batchType:/inbound/i.test(d.type||"")?"inbound":"outbound",status,createdAt:date,updatedAt:d.completedAt||date,fromCompany:d.fromCompanyName||"",toCompany:d.toCompanyName||"",vesselRef:"",orderDate:date.slice(0,10),lotRef:d.batchId||"",notes:d.notes||"",speciesLines:(d.lines||[]).map(l=>({species:l.speciesName||"",weightKg:Number(l.qty||0)})),transportLegs:[],archived:status==="Archived",locked:status!=="Created",receivedAt:d.completedAt};
+ return {id:d.id,serverVersion:d.version,batchType:/inbound/i.test(d.type||"")?"inbound":"outbound",status,createdAt:date,updatedAt:d.completedAt||date,fromCompany:d.fromCompanyName||"",toCompany:d.toCompanyName||"",vesselRef:"",orderDate:date.slice(0,10),lotRef:d.batchId||"",notes:d.notes||"",speciesLines:(d.lines||[]).map(l=>({species:l.speciesName||"",weightKg:Number(l.qty||0)})),transportLegs:[],archived:status==="Archived",locked:status!=="Created",receivedAt:d.completedAt};
 }
 async function loadBatches(_companyId:string):Promise<Batch[]> {
  const rows=await api<ServerDocket[]>("/dockets");
@@ -1220,85 +1221,31 @@ const [speciesLibrary, setSpeciesLibrary] = useState<string[]>(() => lsJson(SPEC
     };
   }, [session, addToast]);
 
-  const createBatch = useCallback(
-    async (b: Batch) => {
-      // Supabase-first
-      if (supabase) {
-        const now = new Date().toISOString();
-        const toSave: Batch = { ...b, createdAt: b.createdAt || now, updatedAt: now };
-        const r = await sbUpsertBatch(activeCompanyId, toSave);
-        if (!r.ok) {
-          addToast("error", r.error || "Supabase save failed");
-          return;
-        }
-        addToast("success", "Docket created");
-        const fresh = await loadBatches(activeCompanyId);
-        setBatches(fresh);
-        return;
-      }
-
-      // Local fallback
-      setBatches((p) => [b, ...p]);
-      addToast("success", "Docket created");
-    },
-    [addToast, activeCompanyId]
-  );
-
-  const updateBatch = useCallback(
-    async (id: string, updates: Partial<Batch>) => {
-      // Supabase-first
-      if (supabase) {
-        const current = batches.find((x) => x.id === id);
-        const merged = current ? ({ ...current, ...updates, updatedAt: nowISO() } as Batch) : null;
-        if (!merged) return;
-
-        const r = await sbUpsertBatch(activeCompanyId, merged);
-        if (!r.ok) {
-          addToast("error", r.error || "Supabase update failed");
-          return;
-        }
-
-        const fresh = await loadBatches(activeCompanyId);
-        setBatches(fresh);
-        return;
-      }
-
-      // Local fallback
-      setBatches((p) => p.map((b) => (b.id === id ? { ...b, ...updates, updatedAt: nowISO() } : b)));
-    },
-    [addToast, batches, activeCompanyId]
-  );
-
-  const deleteBatch = useCallback(
-    async (id: string) => {
-      const b = batches.find((x) => x.id === id);
-      if (b && isLocked(b)) {
-        addToast("error", "This batch is locked and cannot be deleted.");
-        return;
-      }
-
-      // Supabase-first
-      if (supabase) {
-        const { error } = await supabase.from("batches").delete().eq("id", id).eq("company_id", activeCompanyId);
-        if (error) {
-          addToast("error", error.message);
-          return;
-        }
-        addToast("info", "Deleted");
-        const fresh = await loadBatches(activeCompanyId);
-        setBatches(fresh);
-        setView("batches");
-        return;
-      }
-
-      // Local fallback
-      setBatches((p) => p.filter((x) => x.id !== id));
-      setView("batches");
-      addToast("info", "Deleted");
-    },
-    [addToast, batches, activeCompanyId]
-  );
-
+  const createBatch = useCallback(async (b:Batch) => {
+    try {
+      const payload = {id:b.id,batchId:b.lotRef||b.id,type:b.batchType==="inbound"?"Inbound":"Outbound",status:"Created",fromCompanyName:b.fromCompany,toCompanyName:b.toCompany,fromCompanyId:b.batchType==="outbound"?vpsAccount?.company_id:"external",toCompanyId:b.batchType==="inbound"?vpsAccount?.company_id:"external",lines:b.speciesLines.map(l=>({speciesCode:l.species.slice(0,30).toUpperCase(),speciesName:l.species,qty:l.weightKg})),notes:b.notes,createdAt:b.createdAt};
+      await api("/dockets",{method:"POST",body:JSON.stringify(payload)});
+      setBatches(await loadBatches(vpsAccount?.company_id||""));
+      addToast("success","Docket created");
+    } catch(e) {addToast("error",e instanceof Error?e.message:"Docket could not be saved");}
+  },[addToast,vpsAccount]);
+  const updateBatch = useCallback(async (id:string,updates:Partial<Batch>) => {
+    const current=batches.find(b=>b.id===id);
+    if(!current){addToast("error","Docket not found");return;}
+    try {
+      const patch:any={};
+      if(updates.status)patch.status=updates.status==="Completed"?"Complete":updates.status;
+      if(updates.notes!==undefined)patch.notes=updates.notes;
+      if(updates.fromCompany!==undefined)patch.fromCompanyName=updates.fromCompany;
+      if(updates.toCompany!==undefined)patch.toCompanyName=updates.toCompany;
+      if(updates.speciesLines)patch.lines=updates.speciesLines.map(l=>({speciesCode:l.species.slice(0,30).toUpperCase(),speciesName:l.species,qty:l.weightKg}));
+      await api("/dockets/"+encodeURIComponent(id),{method:"PATCH",body:JSON.stringify({version:current.serverVersion,patch})});
+      setBatches(await loadBatches(vpsAccount?.company_id||""));
+    }catch(e){addToast("error",e instanceof Error?e.message:"Update failed");}
+  },[batches,vpsAccount,addToast]);
+  const deleteBatch = useCallback(async (id:string) => {
+    addToast("error","Deletion is disabled until the VPS deletion endpoint is verified. No records were removed.");
+  },[addToast]);
   const archiveBatch = useCallback(
     async (id: string) => {
       const b = batches.find((x) => x.id === id);
