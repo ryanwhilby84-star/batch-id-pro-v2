@@ -14,6 +14,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { createClient, type Session, type User } from "@supabase/supabase-js";
+import { authApi, type Account } from "./ztackApi";
+import { ZtackAuth } from "./ZtackAuth";
 
 /* ---------- localStorage helpers (BUILD-SAFE) ---------- */
 function lsGet(key: string): string {
@@ -1118,12 +1120,23 @@ function CompanySelector({
 
 function AppInner() {
   const [session, setSession] = useState<Session | null>(null);
+  const [vpsAccount, setVpsAccount] = useState<Account | null>(null);
+  const [vpsAuthLoading, setVpsAuthLoading] = useState(true);
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState<boolean>(!!supabase);
   const [companies, setCompanies] = useState<any[]>([]);
   const [selectedCompanyId, setSelectedCompanyId] = useState<string | null>(null);
   const selectedCompany = useMemo(() => companies.find((c: any) => c?.id === selectedCompanyId) || null, [companies, selectedCompanyId]);
   const selectedCompanyRole = String((selectedCompany as any)?.role || "member");
+
+  // VPS session check; never fall back to an unauthenticated local session.
+  useEffect(() => {
+    let active = true;
+    authApi.me().then(({ user }) => { if (active) setVpsAccount(user); })
+      .catch(() => { if (active) setVpsAccount(null); })
+      .finally(() => { if (active) setVpsAuthLoading(false); });
+    return () => { active = false; };
+  }, []);
 
   // Supabase auth listener
   useEffect(() => {
@@ -1395,6 +1408,11 @@ const [speciesLibrary, setSpeciesLibrary] = useState<string[]>(() => lsJson(SPEC
     setSelectedBatchId(null);
     setView("dashboard");
 
+    if (vpsAccount) {
+      await authApi.logout();
+      setVpsAccount(null);
+      return;
+    }
     if (supabase) {
       await supabase.auth.signOut();
       return;
@@ -1417,12 +1435,16 @@ const [speciesLibrary, setSpeciesLibrary] = useState<string[]>(() => lsJson(SPEC
   const [view, setView] = useState<View>("dashboard");
   const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
 
-  if (authLoading) {
+  if (authLoading || vpsAuthLoading) {
     return (
       <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#080D14", color: "white" }}>
         Loading...
       </div>
     );
+  }
+
+  if (!vpsAccount) {
+    return <ZtackAuth onLogin={setVpsAccount} />;
   }
 
   if (supabase && !user) {
@@ -1451,7 +1473,7 @@ const [speciesLibrary, setSpeciesLibrary] = useState<string[]>(() => lsJson(SPEC
   return (
     <div style={S.app}>
       <ToastBar toasts={toasts} />
-      <Header view={view} setView={setView} closeBatch={closeBatch} stats={stats} onLogout={doLogout} showLogout={!!supabase || !!localSession} />
+      <Header view={view} setView={setView} closeBatch={closeBatch} stats={stats} onLogout={doLogout} showLogout={!!vpsAccount || !!supabase || !!localSession} />
       <div style={S.container}>
         {view === "dashboard" && <Dashboard stats={stats} setView={setView} />}
         {view === "batches" && <BatchesView batches={filteredBatches} tab={batchTab} setTab={setBatchTab} openBatch={openBatch} deleteBatch={deleteBatch} />}
