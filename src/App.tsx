@@ -1085,6 +1085,8 @@ function CompanySelector({
 
 
 function AppInner() {
+  const [view, setView] = useState<View>("dashboard");
+  const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [vpsAccount, setVpsAccount] = useState<Account | null>(null);
   const [vpsAuthLoading, setVpsAuthLoading] = useState(true);
@@ -1343,8 +1345,7 @@ const [speciesLibrary, setSpeciesLibrary] = useState<string[]>(() => lsJson(SPEC
 
   const activeCompanyId = supabase ? (selectedCompanyId as string) : "local";
 
-  const [view, setView] = useState<View>("dashboard");
-  const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
+
 
   if (authLoading || vpsAuthLoading) {
     return (
